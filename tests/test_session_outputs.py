@@ -18,7 +18,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -156,15 +156,21 @@ def test_complete_review_saves_decisions_and_approval_without_export(workflow: W
     target = session_database(workflow.root, sample.session_id).parent / "masks" / "image_000.png"
     candidates = workflow.predictions.load(sample, workflow.reviews.objects(sample, revision)[0]["prediction_id"])
     assert candidates is not None
-    with Image.open(target) as mask:
-        assert np.array_equal(np.asarray(mask) > 0, candidates[0].mask.pixels)
+    if status == "accepted":
+        with Image.open(target) as mask:
+            assert np.array_equal(np.asarray(mask) > 0, candidates[0].mask.pixels)
+    else:
+        assert not target.exists()
     assert not list((workflow.root / "annotations").rglob("*.png"))
-    assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"]
+    assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"] == (status == "accepted")
     with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
-        expected = (target.relative_to(workflow.root).as_posix(), digest_file(target))
-        assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone() == expected
         if status == "accepted":
+            expected = (target.relative_to(workflow.root).as_posix(), digest_file(target))
+            assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone() == expected
             assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_objects WHERE revision=?", (revision,)).fetchone() == expected
+        else:
+            assert connection.execute("SELECT mask_path FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone()[0].startswith("memory:")
+            assert connection.execute("SELECT COUNT(*) FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchone() == (0,)
 
 
 @pytest.mark.parametrize("consent", [False, True])
@@ -175,6 +181,8 @@ def test_complete_review_existing_mask_requires_overwrite_consent(workflow: Work
     target = session_database(workflow.root, sample.session_id).parent / "masks" / "image_000.png"
     target.parent.mkdir()
     target.write_bytes(b"previous-mask")
+    with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection, connection:
+        connection.execute("INSERT INTO sam3_approved_masks VALUES (?, ?, ?, ?)", (revision, 0, target.relative_to(workflow.root).as_posix(), digest_file(target)))
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
     payload = {"revision": revision, "reviewer": "operator", "confirm_complete": True, "decisions": [{"object_index": 0, "status": "accepted"}], "overwrite_masks": consent}
     assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"]
@@ -373,6 +381,8 @@ def test_dino_manual_selection_accepts_one_low_score_candidate_and_survives_rest
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
 
     server._complete_review(payload)
+    masks = session_database(workflow.root, sample.session_id).parent / "masks"
+    assert sorted(path.name for path in masks.glob("*.png")) == ["image_001.png"]
     workflow.reviews.initialize()
     workflow.store.sync_object_reviews()
     workflow.store.sync_existing_exports()
@@ -390,6 +400,211 @@ def test_dino_manual_selection_accepts_one_low_score_candidate_and_survives_rest
         assert connection.execute("SELECT object_index FROM sam3_dino_results WHERE revision=? AND is_dino_ready=1", (revision,)).fetchall() == [(1,)]
         assert connection.execute("SELECT is_yolo_ready FROM sam3_yolo_results WHERE revision=?", (revision,)).fetchone()[0] == 0
         assert connection.execute("SELECT object_index, previous_uid, instrument_uid, instance_no FROM sam3_object_assignment_events WHERE revision=?", (revision,)).fetchall() == [(1, None, "tool", 1)]
+
+
+def _seed_old_masks(workflow: Workflow, revision: str) -> Path:
+    """旧バグで全候補を保存した状態を一時DBに作る。"""
+    database = session_database(workflow.root, workflow.samples[0].session_id)
+    directory = database.parent / "masks"
+    directory.mkdir(exist_ok=True)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for index in range(3):
+            target = directory / f"image_{index:03d}.png"
+            target.write_bytes(f"old-{index}".encode())
+            connection.execute("INSERT INTO sam3_approved_masks VALUES (?, ?, ?, ?)", (revision, index, target.relative_to(workflow.root).as_posix(), digest_file(target)))
+    return directory
+
+
+@pytest.mark.parametrize("selected", [None, 1, 2])
+def test_dino_cleanup_removes_rejected_masks_without_overwrite_consent(workflow: Workflow, selected: int | None) -> None:
+    """不採用PNGだけの存在は同意を要求せず、今回採用だけを保存する。"""
+    revision, payload = _ambiguous_dino(workflow)
+    sample = workflow.samples[0]
+    directory = _seed_old_masks(workflow, revision)
+    if selected is not None:
+        (directory / f"image_{selected:03d}.png").unlink()
+    for decision, assignment in zip(payload["decisions"], payload["assignments"], strict=True):
+        accepted = decision["object_index"] == selected
+        decision["status"] = "accepted" if accepted else "rejected"
+        assignment.update(instrument_uid="tool" if accepted else None, instance_no=1 if accepted else None)
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review(payload)
+
+    expected = [] if selected is None else [f"image_{selected:03d}.png"]
+    assert sorted(path.name for path in directory.glob("*.png")) == expected
+    with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
+        assert connection.execute("SELECT object_index FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchall() == ([] if selected is None else [(selected,)])
+        rows = connection.execute("SELECT object_index, mask_path, is_dino_ready FROM sam3_dino_results WHERE revision=? ORDER BY object_index", (revision,)).fetchall()
+        assert len(rows) == len(payload["decisions"])
+        for index, path, ready in rows:
+            assert ready == int(index == selected)
+            assert path.startswith("memory:") == (index != selected)
+        assert connection.execute("SELECT COUNT(*) FROM sam3_object_review_events WHERE revision=?", (revision,)).fetchone() == (3,)
+
+
+def test_dino_switch_cleans_old_revision_ledger_but_keeps_history(workflow: Workflow) -> None:
+    """採用切替で旧版の正式参照も整理し、推論と監査履歴は保持する。"""
+    sample = workflow.samples[0]
+    old_revision = workflow.revisions[sample.session_id]
+    _publish(workflow, sample)
+    other_manifest = _publish(workflow, workflow.samples[1])
+    other_bytes = other_manifest.read_bytes()
+    other_mask = session_database(workflow.root, workflow.samples[1].session_id).parent / "masks" / "image_000.png"
+    other_png = other_mask.read_bytes()
+    database = session_database(workflow.root, sample.session_id)
+    with closing(sqlite3.connect(database)) as connection:
+        originals = connection.execute("SELECT * FROM sam3_prediction_objects").fetchall()
+        old_events = connection.execute("SELECT * FROM sam3_object_review_events WHERE revision=?", (old_revision,)).fetchall()
+    revision, payload = _ambiguous_dino(workflow)
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review(payload)
+    payload["decisions"][1]["status"] = "rejected"
+    payload["decisions"][2]["status"] = "accepted"
+    payload["assignments"][1].update(instrument_uid=None, instance_no=None)
+    payload["assignments"][2].update(instrument_uid="tool", instance_no=1)
+    server._complete_review(payload)
+
+    directory = database.parent / "masks"
+    assert sorted(path.name for path in directory.glob("*.png")) == ["image_002.png"]
+    assert other_mask.read_bytes() == other_png
+    assert other_manifest.read_bytes() == other_bytes
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT * FROM sam3_prediction_objects WHERE prediction_id=?", (originals[0][2],)).fetchall() == originals
+        assert connection.execute("SELECT * FROM sam3_object_review_events WHERE revision=?", (old_revision,)).fetchall() == old_events
+        assert connection.execute("SELECT revision, object_index FROM sam3_approved_masks").fetchall() == [(revision, 2)]
+        assert connection.execute("SELECT mask_path, is_dino_ready FROM sam3_dino_results WHERE revision=?", (old_revision,)).fetchone()[0].startswith("memory:")
+        assert connection.execute("SELECT object_index FROM sam3_dino_objects").fetchall() == [(2,)]
+
+
+def test_dino_cleanup_preserves_other_image_in_same_session(workflow: Workflow) -> None:
+    """同じセッションの前方一致名の他画像と未登録ファイルを保護する。"""
+    sample = workflow.samples[0]
+    database = session_database(workflow.root, sample.session_id)
+    other_path = sample.image_path.with_name("image_extra.png")
+    other_path.write_bytes(sample.image_path.read_bytes())
+    other = replace(sample, image_id="other", image_path=other_path, source_path=other_path.relative_to(workflow.root).as_posix())
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(
+            """INSERT INTO images SELECT session_id, 'other', declaration_id, arrangement_no,
+            ?, sha256, width, height, tag_revision, tag_status, depth_path FROM images WHERE image_id=?""",
+            (other.source_path, sample.image_id),
+        )
+        connection.execute("INSERT INTO hints SELECT 'other', instrument_uid, instance_no, visible, hint_source, center_json, end_a_json, end_b_json, occluded FROM hints WHERE image_id=?", (sample.image_id,))
+    prediction_id = workflow.reviews.objects(sample, workflow.revisions[sample.session_id])[0]["prediction_id"]
+    candidates = workflow.predictions.load(sample, prediction_id)
+    assert candidates is not None
+    workflow.predictions.save(other, prediction_id, candidates, SIGNATURE)
+    other_revision = workflow.store.save_draft(other, candidates, MatchResult((Assignment(0, "tool", 1),), ()), prediction_id, "matching")
+    workflow.reviews.decide(other, other_revision, 0, status="accepted", reviewer="operator")
+    workflow.store.approve(other_revision, "operator", confirm_complete=True)
+    manifest = workflow.store.export_approved(workflow.store.root / "other-export", sample.session_id)
+    revision, payload = _ambiguous_dino(workflow)
+    directory = _seed_old_masks(workflow, revision)
+    (directory / "image_001.png").unlink()
+    unrelated = directory / "image_999.png"
+    unrelated.write_bytes(b"untracked")
+    protected_paths = [other_path, directory / "image_extra_000.png", unrelated, manifest]
+    protected = {path: path.read_bytes() for path in protected_paths}
+    with closing(sqlite3.connect(database)) as connection:
+        yolo = connection.execute("SELECT * FROM sam3_yolo_results WHERE revision=?", (other_revision,)).fetchall()
+        dino = connection.execute("SELECT * FROM sam3_dino_results WHERE revision=?", (other_revision,)).fetchall()
+        masks = connection.execute("SELECT * FROM sam3_approved_masks WHERE revision=?", (other_revision,)).fetchall()
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review(payload)
+
+    assert {path: path.read_bytes() for path in protected_paths} == protected
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("SELECT * FROM sam3_yolo_results WHERE revision=?", (other_revision,)).fetchall() == yolo
+        assert connection.execute("SELECT * FROM sam3_dino_results WHERE revision=?", (other_revision,)).fetchall() == dino
+        assert connection.execute("SELECT * FROM sam3_approved_masks WHERE revision=?", (other_revision,)).fetchall() == masks
+
+
+@pytest.mark.parametrize("failure", ["no_consent", "replace", "delete", "sql", "commit"])
+def test_dino_cleanup_failure_restores_all_files_and_database(workflow: Workflow, monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    """削除を伴う保存の通常失敗とcommit失敗でファイル・全SQLを復元する。"""
+    revision, payload = _ambiguous_dino(workflow)
+    directory = _seed_old_masks(workflow, revision)
+    database = session_database(workflow.root, workflow.samples[0].session_id)
+    if failure in {"sql", "commit"}:
+        with closing(sqlite3.connect(database)) as connection, connection:
+            if failure == "sql":
+                connection.execute("""CREATE TRIGGER fail_cleanup BEFORE UPDATE ON sam3_review_revisions
+                    BEGIN SELECT RAISE(ABORT, 'cleanup SQL failure'); END""")
+            else:
+                connection.executescript("""
+                    CREATE TABLE commit_parent(id INTEGER PRIMARY KEY);
+                    CREATE TABLE commit_child(id INTEGER REFERENCES commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+                    CREATE TRIGGER fail_commit AFTER UPDATE ON sam3_review_revisions
+                    BEGIN INSERT INTO commit_child VALUES (1); END;
+                """)
+    before_files = {path: path.read_bytes() for path in directory.glob("*.png")}
+    with closing(sqlite3.connect(database)) as connection:
+        before_sql = list(connection.iterdump())
+    if failure == "replace":
+        original_replace = Path.replace
+
+        def fail_replace(path: Path, target: Path) -> Path:
+            if path.name.startswith("new-"):
+                raise OSError("test replacement failure")
+            return original_replace(path, target)
+
+        monkeypatch.setattr(Path, "replace", fail_replace)
+    elif failure == "delete":
+        original_unlink = Path.unlink
+
+        def fail_unlink(path: Path, missing_ok: bool = False) -> None:
+            if path == directory / "image_002.png":
+                raise OSError("test deletion failure")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", fail_unlink)
+    if failure != "no_consent":
+        payload["overwrite_masks"] = True
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    with pytest.raises(CaptureError):
+        server._complete_review(payload)
+
+    assert {path: path.read_bytes() for path in directory.glob("*.png")} == before_files
+    assert not list(directory.glob(".mask-save-*"))
+    with closing(sqlite3.connect(database)) as connection:
+        assert list(connection.iterdump()) == before_sql
+    assert not (workflow.store.root / "approvals" / f"{revision}.json").exists()
+
+
+@pytest.mark.parametrize("conflict", ["unknown", "prediction", "foreign", "outside"])
+def test_dino_cleanup_refuses_unsafe_ownership(workflow: Workflow, conflict: str) -> None:
+    """所有不明・共有原本・他画像・領域外のファイルは同意があっても変更しない。"""
+    revision, payload = _ambiguous_dino(workflow)
+    directory = _seed_old_masks(workflow, revision)
+    database = session_database(workflow.root, workflow.samples[0].session_id)
+    path = (directory / "image_000.png").relative_to(workflow.root).as_posix()
+    with closing(sqlite3.connect(database)) as connection, connection:
+        if conflict == "unknown":
+            connection.execute("DELETE FROM sam3_approved_masks WHERE revision=? AND object_index=0", (revision,))
+        elif conflict == "prediction":
+            connection.execute("UPDATE sam3_prediction_objects SET mask_path=? WHERE prediction_id<>?", (path, workflow.reviews.objects(workflow.samples[0], revision)[0]["prediction_id"]))
+        elif conflict == "foreign":
+            old_revision = connection.execute("SELECT revision FROM sam3_review_revisions WHERE is_current=0").fetchone()[0]
+            connection.execute("UPDATE sam3_review_revisions SET image_id='other' WHERE revision=?", (old_revision,))
+            connection.execute("INSERT INTO sam3_approved_masks VALUES (?, 0, ?, 'old')", (old_revision, path))
+        else:
+            connection.execute("UPDATE sam3_approved_masks SET mask_path=? WHERE revision=? AND object_index=0", (workflow.samples[0].source_path, revision))
+    payload["overwrite_masks"] = True
+    before = {item: item.read_bytes() for item in workflow.root.rglob("*.png")}
+    with closing(sqlite3.connect(database)) as connection:
+        before_sql = list(connection.iterdump())
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    with pytest.raises(CaptureError):
+        server._complete_review(payload)
+
+    assert {item: item.read_bytes() for item in workflow.root.rglob("*.png")} == before
+    with closing(sqlite3.connect(database)) as connection:
+        assert list(connection.iterdump()) == before_sql
 
 
 @pytest.mark.parametrize("damage", ["duplicate", "unknown", "partial", "boolean", "unresolved", "index"])
@@ -573,7 +788,8 @@ def test_session_outputs_publication_is_independent(workflow: Workflow, target: 
     assert _flags(workflow, first) == (0, 0)
 
     if target == "dino":
-        workflow.reviews.decide(first, revision, 0, status="accepted", reviewer="operator")
+        server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+        server._complete_review({"revision": revision, "reviewer": "operator", "confirm_complete": True, "decisions": [{"object_index": 0, "status": "accepted"}]})
     else:
         workflow.store.export_approved(workflow.store.root / "exports" / first.session_id, first.session_id)
 

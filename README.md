@@ -8,6 +8,8 @@
 uv sync
 ```
 
+Windowsでは`pywin32>=312`をWindows専用依存として導入する。`arena-api`・`camlib`などlock外の手動導入パッケージがある既存環境では、通常の同期で除去されるため、実行・検証には`uv run --no-sync ...`を使う。
+
 Hugging Faceの`facebook/sam3`モデルにアクセスできるアカウントを用意し、`src/.env`に`HF_TOKEN`を設定します。ローカル重みを使う場合は`src/configs/capture.json`の`checkpoint`にファイルパスを設定します。`null`ならSAM3モデルビルダーがHugging Faceから取得します。
 
 設定ファイルの`capture_root`、`output_root`、`prompt`、`min_score`を確認する。相対パスは設定ファイルの位置が基準である。正式maskの保存先は各セッション直下の`masks`である。`mask_root`は旧設定との互換用で、新規PNGの保存先には使わない。
@@ -67,13 +69,17 @@ uv run python src/capture_workflow.py migrate-predictions
 
 各セッションDBと`annotation_work`をバックアップしてから、既存草案の確認画面を開く。`review`は追加SQL schemaと現行レビューを非破壊同期する。一覧表示だけではモデルやGPUを初期化しない。maskの確認時に保存済みデータがなければSAM3を遅延初期化して再推論する。再起動前と同じ推論設定・GPU環境が必要であり、設定や推論結果の不一致はエラーとして通知する。
 
+保存済みmaskのファイル欠損は正常に再推論を待つ状態として扱い、画像ごとの理由とパスはDEBUGにのみ記録する。通常のINFOにはこの欠損通知を出さず、実際の再推論開始や他の警告・例外は従来どおり記録する。
+
 ```powershell
 uv run python src/capture_workflow.py review
 ```
 
 一覧の「DINO物体確認」から元の推論bbox・maskを物体ごとに確認する。担当者は画面上部へ入力する。未判定で器具対応済みの物体は「DINOに使う」を初期選択し、既存の不採用は維持する。「保存して次へ」で画像内の全物体の採否と画像承認を一括保存する。器具対応未確定の物体は採用できず、mask補正機能はない。YOLO用の矩形追加・削除・再ラベルは「YOLO注釈」で行う。
 
-有効な画像承認と物体の採用判定に加え、正式maskの保存が揃った新規結果だけを、`sam3_dino_results.is_dino_ready`で公開可能とする。既存の`sam3_dino_objects`ビューも各セッションDB内で維持する。「保存して次へ」で正式mask PNGを保存し、DINOの参照先を記録する。別の原本PNGとの二重保存は行わない。GUIには「保存済みmaskあり」を表示し、既存ファイルの上書きはYesで同意した場合だけ行う。Noでは保存せず同じ画像に留まる。この操作はYOLO exportを再作成しない。レビューschema version 4へ非破壊更新し、既存maskの自動移動・削除は行わない。詳細は[撮影データ連携手順](docs/capture_workflow.md#承認用maskと上書き確認)を参照する。
+有効な画像承認と物体の採用判定に加え、正式maskの保存が揃った新規結果だけを、`sam3_dino_results.is_dino_ready`で公開可能とする。既存の`sam3_dino_objects`ビューも各セッションDB内で維持する。別の原本PNGとの二重保存は行わない。
+
+[合意済みのDINO mask保存バグ修正仕様](docs/dino_mask_save_fix.md)（実装未実施）では、「保存して次へ」で今回採用したmaskだけをPNG保存し、その採用先に既存ファイルがある場合だけYesで上書き同意を求める。Noでは保存せず同じ画像に留まる。旧採用maskやバグ由来の不要maskは対象画像の再保存成功時に整理する。他画像・他セッション・推論原本・監査履歴・YOLO状態は変更せず、一括移動・削除は行わない。通常の保存失敗・SQL確定失敗では削除分も復元する。所有識別などの実装前確認事項、[撮影データ連携手順](docs/capture_workflow.md#承認用maskと上書き確認)、[公開契約](docs/contracts/dino_mask_publication.md)を参照する。
 
 DINOでも器具タグ（UID＋個体番号）ごとに候補を手動採用できる。タグを選び、画像上のbboxまたは候補一覧からmaskを確認し、「選択タグにこのDINO候補を採用」を押す。低スコアや自動対応が曖昧な候補も選択可能である。同じタグの旧採用候補は確認後に解除し、1タグにつき最大1候補を採用する。「未判定候補を使わないにする」で余剰候補の採否を確定できる。全候補のmask確認後に保存する。新しい画面のDINO保存は未解決のYOLO注釈を変更・承認せず、有効なYOLO承認がなければDINO専用承認とする。既存の有効なYOLO承認・公開は維持する。レビューschema version 5で手動対応履歴を追加し、対応・採否・maskを同時に確定する。未承認のYOLO公開には別途YOLOの確認・承認が必要である。
 

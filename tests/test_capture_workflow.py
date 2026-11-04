@@ -669,6 +669,7 @@ def test_object_review_overlay_preserves_original_mask(tmp_path: Path) -> None:
 def test_object_review_mask_corruption_rejects_acceptance(tmp_path: Path) -> None:
     """正式保存maskの改変を、再起動後の確認済みデータとして受け入れない。"""
     store, reviews, sample, revision = _object_review(tmp_path)
+    reviews.decide(sample, revision, 0, status="accepted", reviewer="operator")
     store.approve(revision, "operator", confirm_complete=True)
     with sqlite3.connect(reviews.database_path) as connection:
         relative = connection.execute("SELECT mask_path FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchone()[0]
@@ -681,7 +682,7 @@ def test_object_review_mask_corruption_rejects_acceptance(tmp_path: Path) -> Non
         server._set_object_review({"revision": revision, "object_index": 0, "status": "accepted", "reviewer": "operator", "confirm_original": True})
 
     with sqlite3.connect(reviews.database_path) as connection:
-        assert connection.execute("SELECT dino_status FROM sam3_object_reviews WHERE revision=?", (revision,)).fetchone() == ("pending",)
+        assert connection.execute("SELECT dino_status FROM sam3_object_reviews WHERE revision=?", (revision,)).fetchone() == ("accepted",)
 
 
 def test_object_review_unresolved_assignment_rejects_acceptance(tmp_path: Path) -> None:

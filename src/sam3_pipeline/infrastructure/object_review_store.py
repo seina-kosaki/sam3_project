@@ -260,7 +260,7 @@ class SqliteObjectReviewStore:
                 missing = connection.execute(
                     """SELECT 1 FROM sam3_object_reviews v
                     LEFT JOIN sam3_approved_masks m USING(revision, object_index)
-                    WHERE v.revision=? AND m.mask_path IS NULL LIMIT 1""",
+                    WHERE v.revision=? AND v.dino_status='accepted' AND m.mask_path IS NULL LIMIT 1""",
                     (revision,),
                 ).fetchone()
             write_masks = decisions is not None or missing is not None
@@ -325,10 +325,19 @@ class SqliteObjectReviewStore:
                 database = session_database(self.database_path, sample.session_id)
                 root = capture_root(sample)
                 originals = connection.execute(
-                    """SELECT object_index, mask_path, mask_sha256
-                    FROM sam3_prediction_objects WHERE session_id=? AND image_id=? AND prediction_id=?""",
-                    (sample.session_id, sample.image_id, row["prediction_id"]),
+                    """SELECT o.object_index, o.mask_path, o.mask_sha256
+                    FROM sam3_prediction_objects o
+                    JOIN sam3_object_reviews v ON v.object_index=o.object_index AND v.revision=?
+                    WHERE o.session_id=? AND o.image_id=? AND o.prediction_id=? AND v.dino_status='accepted'""",
+                    (revision, sample.session_id, sample.image_id, row["prediction_id"]),
                 ).fetchall()
+                targets = {mask_destination(database, sample, original["object_index"]) for original in originals}
+                remove = self._mask_cleanup(connection, sample, database, root, targets)
+                connection.execute(
+                    """DELETE FROM sam3_approved_masks WHERE revision IN
+                    (SELECT revision FROM sam3_review_revisions WHERE session_id=? AND image_id=?)""",
+                    (sample.session_id, sample.image_id),
+                )
                 files = []
                 by_index = {candidate.index: candidate for candidate in candidates}
                 for original in originals:
@@ -353,7 +362,7 @@ class SqliteObjectReviewStore:
                         mask_path=excluded.mask_path, mask_sha256=excluded.mask_sha256""",
                         (revision, original["object_index"], relative, original["mask_sha256"]),
                     )
-                assets.enter_context(publish_masks(files, overwrite=overwrite_masks))
+                assets.enter_context(publish_masks(files, overwrite=overwrite_masks, remove=remove))
                 # 正式保存したPNGのhashを公開参照へ記録する。
                 for _, target in files:
                     connection.execute("UPDATE sam3_approved_masks SET mask_sha256=? WHERE revision=? AND mask_path=?", (digest_file(target), revision, target.relative_to(root).as_posix()))
@@ -365,6 +374,48 @@ class SqliteObjectReviewStore:
                 (self._json(annotation), status, approval["approval_id"] if approved and approval else None, self._json(approval) if approved and approval else None, revision),
             )
             connection.execute("INSERT INTO sam3_review_events(revision, status, annotation_json, approval_json) VALUES (?, ?, ?, ?)", (revision, status, self._json(annotation), self._json(approval) if approval else None))
+
+    @staticmethod
+    def _mask_cleanup(connection: sqlite3.Connection, sample: CaptureSample, database: Path, root: Path, targets: set[Path]) -> list[Path]:
+        directory = (database.parent / "masks").resolve()
+        identity = (sample.session_id, sample.image_id)
+        owners: dict[Path, set[tuple[str, str]]] = {}
+        for item in connection.execute(
+            """SELECT m.mask_path, r.session_id, r.image_id
+            FROM sam3_approved_masks m JOIN sam3_review_revisions r USING(revision)"""
+        ):
+            path = (root / item["mask_path"]).resolve()
+            owners.setdefault(path, set()).add((item["session_id"], item["image_id"]))
+        owned = {path for path, identities in owners.items() if identity in identities}
+        if any(path.parent != directory or path.suffix.lower() != ".png" for path in owned | targets):
+            raise CaptureError("承認用maskの台帳または保存先がセッションのmasks外である")
+
+        # ファイル名ではなく台帳で所有を確定する。未登録の旧候補は推測で削除しない。
+        expected = set(targets)
+        for item in connection.execute(
+            """SELECT DISTINCT p.object_index, r.source_path
+            FROM sam3_review_revisions r JOIN sam3_prediction_objects p
+            USING(session_id, image_id, prediction_id)
+            WHERE r.session_id=? AND r.image_id=?""",
+            identity,
+        ):
+            expected.add((directory / f"{Path(item['source_path']).stem}_{item['object_index']:03d}.png").resolve())
+        affected = owned | targets
+        if any(path.exists() and path not in owned for path in expected):
+            raise CaptureError("既存maskの画像所有を台帳で確認できない。保存を中止しました")
+        if any(owners.get(path, set()) - {identity} for path in affected):
+            raise CaptureError("同名のmaskを別画像が使用している。元画像名を一意にしてください")
+
+        protected = set()
+        for item in connection.execute("SELECT mask_path FROM sam3_prediction_objects WHERE mask_path NOT LIKE 'memory:%'"):
+            protected.add((root / item["mask_path"]).resolve())
+        for item in connection.execute("SELECT path, depth_path FROM images"):
+            protected.update((root / value).resolve() for value in item if value)
+        for item in connection.execute("SELECT source_path FROM sam3_predictions"):
+            protected.add((root / item["source_path"]).resolve())
+        if affected & protected:
+            raise CaptureError("承認用maskが推論原本または撮影原本と共有されている。保存を中止しました")
+        return sorted(owned - targets)
 
     def objects(self, sample: CaptureSample, revision: str) -> list[dict[str, Any]]:
         """検証済み推論原本と現在の物体別判定を返す。

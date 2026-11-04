@@ -316,7 +316,7 @@ class SqlitePredictionStore:
                 return None
             path = self._asset(value)
             if not path.is_file():
-                LOGGER.info("保存済みmaskがないため確認時に再推論が必要である: %s", path)
+                LOGGER.debug("保存済みmaskがないため確認時に再推論が必要である: %s", path)
                 return None
             if digest_file(path) != row["mask_sha256"]:
                 raise CaptureError("Prediction mask hash changed")

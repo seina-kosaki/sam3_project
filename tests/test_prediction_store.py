@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -184,6 +185,60 @@ def test_load_after_restart_regenerates_preview_without_saving_png(storage: tupl
     assert not list(store.mask_root.rglob("*.png"))
 
 
+@pytest.mark.parametrize("level", [logging.INFO, logging.DEBUG])
+@pytest.mark.parametrize("regenerate", [False, True])
+def test_load_missing_mask_logs_only_debug(
+    storage: tuple[SqlitePredictionStore, CaptureSample], caplog: pytest.LogCaptureFixture, level: int, regenerate: bool,
+) -> None:
+    """実ファイル欠損の詳細はDEBUGに限定し、未生成扱いと再推論を維持する。"""
+    store, sample = storage
+    key = _prediction_id(sample)
+    store.save(sample, key, (_candidate(),), SIGNATURE)
+    relative_path = "session/missing-mask.png"
+    missing_path = store.data_root / relative_path
+    assert not missing_path.exists()
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE sam3_prediction_objects SET mask_path=?", (relative_path,))
+    calls: list[str] = []
+
+    class PreviewPredictor:
+        """欠損maskの再推論対象を記録する。"""
+
+        signature = SIGNATURE
+
+        def infer(self, source: CaptureSample) -> tuple[Candidate, ...]:
+            """固定maskを返し、実モデルを使わず再推論を検証する。"""
+            calls.append(source.image_id)
+            return (_candidate(),)
+
+    restarted = SqlitePredictionStore(
+        store.database_path, store.data_root, store.mask_root, store.timeout,
+        predictor_factory=PreviewPredictor if regenerate else None,
+    )
+    logger_name = "sam3_pipeline.infrastructure.prediction_store"
+    reason = "保存済みmaskがないため確認時に再推論が必要である"
+    with caplog.at_level(level, logger=logger_name):
+        loaded = restarted.load(sample, key)
+        cached = restarted.load(sample, key)
+
+    messages = [record for record in caplog.records if record.name == logger_name and reason in record.getMessage()]
+    if level == logging.INFO:
+        assert not messages
+    else:
+        assert messages
+        assert all(record.levelno == logging.DEBUG and str(missing_path) in record.getMessage() for record in messages)
+    if regenerate:
+        assert loaded is not None and cached is loaded
+        assert calls == [sample.image_id]
+        assert isinstance(loaded[0].mask, ArrayMask)
+        np.testing.assert_array_equal(loaded[0].mask.pixels, _candidate().mask.pixels)
+        assert any(record.levelno == logging.INFO and "確認用maskを再推論する" in record.getMessage() for record in caplog.records)
+    else:
+        assert loaded is None and cached is None
+        assert not calls
+    assert not list(store.mask_root.rglob("*.png"))
+
+
 def test_save_png_failure_retry_publishes_only_complete_result(storage: tuple[SqlitePredictionStore, CaptureSample], monkeypatch: pytest.MonkeyPatch) -> None:
     """2枚目の書き込み失敗時にSQLを公開せず、残った1枚を再実行で照合する。"""
     store, sample = storage
@@ -285,4 +340,3 @@ def test_save_model_metadata_records_recipe(storage: tuple[SqlitePredictionStore
     with sqlite3.connect(store.database_path) as connection:
         value = connection.execute("SELECT model_metadata_json FROM sam3_predictions").fetchone()[0]
         assert json.loads(value) == metadata
-

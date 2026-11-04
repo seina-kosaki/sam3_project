@@ -77,12 +77,13 @@ def capture_root(sample: CaptureSample) -> Path:
 
 
 @contextmanager
-def publish_masks(files: list[tuple[np.ndarray, Path]], *, overwrite: bool) -> Iterator[None]:
+def publish_masks(files: list[tuple[np.ndarray, Path]], *, overwrite: bool, remove: list[Path] | None = None) -> Iterator[None]:
     """推論maskを初めてPNGへ保存し、後続SQLの失敗時には復元する。
 
     Args:
         files: メモリー上の二値maskと正式保存先の組。
         overwrite: 既存maskの上書きに利用者が同意したか。
+        remove: 呼び出し元が対象画像の所有と原本非共有を検証した不要mask。
 
     Yields:
         承認用PNGの配置が完了した状態。
@@ -90,10 +91,11 @@ def publish_masks(files: list[tuple[np.ndarray, Path]], *, overwrite: bool) -> I
     Raises:
         CaptureError: 上書き未同意、原本改変、配置または復元に失敗した場合。
     """
-    if not files:
+    remove = remove or []
+    if not files and not remove:
         yield
         return
-    destination = files[0][1].parent
+    destination = files[0][1].parent if files else remove[0].parent
     destination.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".mask-save-", dir=destination) as temporary:
         staging = Path(temporary)
@@ -104,7 +106,16 @@ def publish_masks(files: list[tuple[np.ndarray, Path]], *, overwrite: bool) -> I
                 raise CaptureError("保存済みmaskがある。上書きするか確認してください")
             Image.fromarray(pixels.astype(np.uint8) * MASK_FOREGROUND).save(staging / f"new-{index}.png", format="PNG")
         try:
+            for index, target in enumerate(remove):
+                if not target.exists():
+                    continue
+                backup = staging / f"removed-{index}.png"
+                shutil.copyfile(target, backup)
+                changed.append((target, backup))
+                target.unlink()
             for index, (_, target) in enumerate(files):
+                if target.exists() and not overwrite:
+                    raise CaptureError("保存済みmaskがある。上書きするか確認してください")  # noqa: TRY301
                 backup = staging / f"old-{index}.png" if target.exists() else None
                 if backup is not None:
                     shutil.copyfile(target, backup)

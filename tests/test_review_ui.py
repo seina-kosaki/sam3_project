@@ -50,6 +50,57 @@ sandbox.testItem = input.item;
 vm.runInContext('items = [testItem]; selectedSession = testItem.session_id; renderGallery();', sandbox);
 process.stdout.write(elements.get("#gallery").innerHTML);
 """
+NODE_SAVE = """
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const elements = new Map(), posts = [];
+let confirmations = 0;
+const document = {
+  querySelector(selector) {
+    if (!elements.has(selector)) {
+      const callbacks = {};
+      const element = {
+        innerHTML: "", textContent: "", value: "operator", disabled: false,
+        getContext: () => ({}), querySelectorAll: () => [],
+        addEventListener(event, callback) { callbacks[event] = callback; },
+        showModal() { confirmations++; element.returnValue = input.answer; callbacks.close(); },
+        close() {}, callbacks
+      };
+      elements.set(selector, element);
+    }
+    return elements.get(selector);
+  },
+  querySelectorAll: () => []
+};
+const sandbox = vm.createContext({
+  document, structuredClone, window: {addEventListener() {}},
+  fetch: async () => ({ok: true, headers: {get: () => "application/json"},
+    json: async () => ({items: [], sessions: []})})
+});
+(async () => {
+  vm.runInContext(input.script, sandbox);
+  await new Promise(resolve => setImmediate(resolve));
+  sandbox.testItem = input.item;
+  sandbox.latest = input.latest;
+  sandbox.posts = posts;
+  vm.runInContext(`
+    items = [structuredClone(testItem)];
+    selectedItem = structuredClone(testItem);
+    viewedObjects = new Set(testItem.objects.map(object => object.object_index));
+    loadItems = async () => false;
+    request = async (url, method, payload) => {
+      if (method === "POST") { posts.push(payload); return {}; }
+      return {items: [latest]};
+    };
+  `, sandbox);
+  await elements.get("#save-object-review").callbacks.click();
+  process.stdout.write(JSON.stringify({
+    confirmations, posts, message: document.querySelector("#object-message").textContent,
+    current: vm.runInContext("items[0]", sandbox),
+    selected: vm.runInContext("selectedItem", sandbox)
+  }));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
 
 
 @pytest.mark.parametrize("confidence,filled", [("low", 1), ("medium", 2), ("high", 3)])
@@ -128,3 +179,54 @@ def test_review_gallery_separates_confidence_and_approval(
     assert html.count('class="filled"') == filled
     assert f'class="confidence {confidence}"' in html
     assert " · 承認済" not in html
+
+
+@pytest.mark.parametrize(
+    "existing,answer,confirmed,saved",
+    [
+        ([], "yes", False, True),
+        ([0, 2], "no", False, True),
+        ([1], "yes", True, True),
+        ([1], "no", True, False),
+        ([1], "", True, False),
+    ],
+)
+def test_dino_save_uses_unsaved_decisions_and_latest_index(
+    existing: list[int], answer: str, *, confirmed: bool, saved: bool,
+) -> None:
+    """配信中の保存ハンドラーで採用先だけ確認し、No/EscapeはPOSTしない。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("レビューUIのJavaScript検証にはNode.jsが必要である")
+    script = TAG_REVIEW_JS.read_text(encoding="utf-8") + "\n" + REVIEW_HTML.read_text(encoding="utf-8").split("<script>", 1)[1].split("</script>", 1)[0]
+    item = {
+        "revision": "revision", "session_id": "session", "annotation": {"shapes": []},
+        "objects": [
+            {"object_index": index, "dino_status": "accepted" if index == 1 else "rejected", "instrument_uid": "tool", "instance_no": 1}
+            for index in range(3)
+        ],
+    }
+    latest = {
+        "revision": "revision",
+        "objects": [
+            {"object_index": index, "dino_status": "rejected" if index == 1 else "accepted", "saved_mask_exists": index in existing}
+            for index in (2, 0, 1)
+        ],
+    }
+
+    result = subprocess.run(
+        [node, "-e", NODE_SAVE],
+        input=json.dumps({"script": script, "item": item, "latest": latest, "answer": answer}),
+        text=True, encoding="utf-8", capture_output=True, check=True, timeout=10,
+    )
+    actual = json.loads(result.stdout)
+
+    assert actual["confirmations"] == int(confirmed)
+    assert len(actual["posts"]) == int(saved)
+    assert actual["selected"] == item
+    if saved:
+        assert actual["posts"][0]["overwrite_masks"] == confirmed
+        assert actual["posts"][0]["decisions"] == [{"object_index": obj["object_index"], "status": obj["dino_status"]} for obj in item["objects"]]
+    else:
+        assert actual["current"] == item
+        assert "保存を中止" in actual["message"]

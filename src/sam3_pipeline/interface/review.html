@@ -728,7 +728,9 @@
         // 開いてから他の保存が行われた場合も、最新の存在情報で確認する。
         const latest = (await request("/api/items")).items.find(item => item.revision === selectedItem.revision);
         if (!latest) throw new Error("レビュー版が更新されました。画面を開き直してください");
-        const overwriteMasks = latest.objects.some(object => object.saved_mask_exists);
+        const latestByIndex = new Map(latest.objects.map(object => [object.object_index, object]));
+        if (objects.length !== latestByIndex.size || objects.some(object => !latestByIndex.has(object.object_index))) throw new Error("候補が更新されました。画面を開き直してください");
+        const overwriteMasks = objects.some(object => object.dino_status === "accepted" && latestByIndex.get(object.object_index).saved_mask_exists);
         if (overwriteMasks && !await confirmMaskOverwrite()) {
           document.querySelector("#object-message").textContent = "保存を中止しました。既存maskと判定は変更していません。";
           return;
