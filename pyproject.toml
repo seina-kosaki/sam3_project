@@ -1,0 +1,63 @@
+[project]
+name = "sam3-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "opencv-python>=4.11.0.86",
+    "psutil>=7.2.2",
+    "pycocotools>=2.0.11",
+    "setuptools<75.0.0",
+    "torch>=2.7.0",
+    "torchvision",
+    "triton-windows>=3.8.0.post28",
+    # 1. dependencies に追加（名前はPyPI上の登録名や対象のpackage名）
+    "sam3",
+    "einops>=0.8.2",
+    "python-dotenv>=1.2.3",
+    "pathspec>=1.1.1",
+    "scipy",
+    "numpy",
+    "pillow",
+    "pyyaml",
+]
+
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "flash-attn-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+flash-attn-3 = { index = "flash-attn-cu128" }
+# 2. GitHub のリポジトリURL（およびブランチ/タグ/コミットHash）を指定
+sam3 = { git = "https://github.com/facebookresearch/sam3.git", branch = "main" }
+
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "ruff",
+]
+
+# 3. [tool.uv.workspace] のセクション（members = ["src/sam3"]）は削除する
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../yolo_train/src"]
+
+[tool.poe.tasks]
+check = [
+  { cmd = "ruff check --fix --quiet --output-format concise" },
+  { cmd = "ruff format --quiet" },
+  { cmd = "mypy --config-file mypy.toml --no-error-summary src" },
+]

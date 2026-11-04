@@ -1,0 +1,1040 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>撮影データ 推論レビュー</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172b29;
+      --muted: #647572;
+      --paper: #f2f4ef;
+      --surface: #ffffff;
+      --line: #d7dfd8;
+      --high: #356f5c;
+      --high-bg: #e3f1e9;
+      --medium: #986219;
+      --medium-bg: #fff1d7;
+      --low: #a43f36;
+      --low-bg: #fbe8e4;
+      --approved: #2456a6;
+      --approved-bg: #e9f0ff;
+      --accent: #c4d948;
+      --shadow: 0 8px 24px rgb(23 43 41 / 9%);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background-color: var(--paper);
+      background-image: radial-gradient(#d5ded5 0.65px, transparent 0.65px);
+      background-size: 12px 12px;
+      font-family: "Aptos", "Yu Gothic UI", sans-serif;
+    }
+    button, input, select { font: inherit; }
+    button { cursor: pointer; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 14px clamp(16px, 4vw, 52px);
+      color: #f6f7ef;
+      background: var(--ink);
+      border-bottom: 4px solid var(--accent);
+    }
+    .brand { font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+    .server-state { color: #d1dfd6; font-size: 12px; }
+    main { max-width: 1600px; margin: 0 auto; padding: 26px clamp(14px, 3vw, 40px) 64px; }
+    .intro { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
+    h1 { margin: 0 0 5px; font-family: Georgia, "Yu Mincho", serif; font-size: 30px; font-weight: 500; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 13px; }
+    .summary { display: flex; gap: 8px; flex-wrap: wrap; }
+    .metric { min-width: 84px; padding: 9px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 5px; }
+    .metric strong { display: block; font-size: 20px; line-height: 1.1; }
+    .metric span { color: var(--muted); font-size: 11px; }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 18px 0 12px; }
+    .session-picker { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .session-picker select { max-width: min(44vw, 380px); height: 34px; padding: 0 8px; border: 1px solid var(--line); border-radius: 4px; background: white; color: var(--ink); }
+    .filters { display: flex; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: #e8ece6; }
+    .filter { padding: 7px 12px; color: var(--muted); border: 0; border-radius: 4px; background: transparent; font-size: 12px; }
+    .filter[aria-pressed="true"] { color: var(--ink); background: var(--surface); box-shadow: 0 1px 3px #172b291c; }
+    .toolbar-note { color: var(--muted); font-size: 12px; }
+    .publish {
+      display: grid;
+      grid-template-columns: minmax(150px, 1fr) minmax(180px, 1.2fr) auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 12px;
+      margin: 12px 0 20px;
+      border: 1px solid #cad4ca;
+      border-left: 4px solid var(--accent);
+      border-radius: 5px;
+      background: #fbfcf8;
+    }
+    .publish input[type="text"] { min-width: 0; height: 36px; padding: 0 10px; border: 1px solid var(--line); border-radius: 4px; background: white; }
+    .publish-destination { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .confirm { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .primary, .secondary { min-height: 36px; padding: 0 14px; border-radius: 4px; font-weight: 700; }
+    .primary { color: var(--ink); border: 1px solid #a8bf2f; background: var(--accent); }
+    .primary:disabled { cursor: not-allowed; opacity: .5; }
+    .secondary { color: var(--ink); border: 1px solid var(--line); background: white; }
+    #notice { min-height: 22px; margin: 4px 0 14px; color: var(--muted); font-size: 13px; }
+    #notice.error { color: var(--low); }
+    #notice.success { color: var(--high); }
+    .gallery { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .tile { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: 0 2px 6px rgb(23 43 41 / 4%); }
+    .tile[hidden] { display: none; }
+    .tile-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 10px 11px 7px; }
+    .tile-title { min-width: 0; }
+    .tile-title strong { display: block; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+    .tile-title small { color: var(--muted); font-size: 10px; }
+    .tile-title small.tag-count { display: block; margin-top: 2px; color: var(--ink); font-weight: 700; }
+    .confidence { display: grid; flex: none; justify-items: end; gap: 5px; font-size: 11px; font-weight: 800; }
+    .confidence.high { color: var(--high); }
+    .confidence.medium { color: var(--medium); }
+    .confidence.low { color: var(--low); }
+    .confidence-meter { display: flex; gap: 3px; }
+    .confidence-meter i { width: 14px; height: 5px; border: 1px solid #9ba9a4; border-radius: 1px; }
+    .confidence-meter i.filled { border-color: currentColor; background: currentColor; }
+    .review-status { display: grid; gap: 7px; margin: 8px 10px 0; padding: 9px; border: 1px solid var(--line); border-radius: 4px; background: #f8fafb; }
+    .review-status-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; }
+    .approval-badge { padding: 3px 7px; border: 1px solid #c8d1d6; border-radius: 12px; color: #53636b; background: #eef1f3; font-size: 10px; font-weight: 700; }
+    .approval-badge.approved { border-color: #b7ccef; color: var(--approved); background: var(--approved-bg); }
+    .dino-counts { color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .status-note { margin: 0 0 12px; color: var(--muted); font-size: 12px; }
+    .thumb-wrap { padding: 0 10px; }
+    .thumb { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #e6eae5; }
+    .reasons { min-height: 30px; padding: 7px 11px 2px; color: var(--muted); font-size: 11px; }
+    .tile-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px 10px; }
+    .tile-actions label { display: flex; align-items: center; gap: 6px; color: var(--ink); font-size: 11px; }
+    .tile-actions input, .confirm input, .empty-check input { accent-color: var(--high); }
+    .small-button { padding: 5px 8px; color: var(--ink); border: 1px solid var(--line); border-radius: 4px; background: white; font-size: 11px; }
+    .exception-row { padding: 0 10px 9px; }
+    .exception-row input { width: 100%; height: 29px; padding: 0 7px; border: 1px solid var(--line); border-radius: 3px; font-size: 11px; }
+    .empty-check { display: none; padding: 0 11px 9px; color: var(--low); font-size: 11px; }
+    .empty-check.visible { display: flex; align-items: center; gap: 5px; }
+    dialog { width: min(1100px, calc(100vw - 24px)); max-width: none; max-height: calc(100vh - 24px); padding: 0; border: 1px solid var(--line); border-radius: 7px; box-shadow: var(--shadow); }
+    dialog::backdrop { background: rgb(12 25 23 / 66%); }
+    .detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+    .detail-head h2 { margin: 0; font-size: 16px; }
+    .detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 280px; min-height: 360px; }
+    .canvas-stage { display: grid; place-items: center; min-height: 360px; padding: 14px; background: #e7ebe6; }
+    #detail-canvas { display: block; max-width: 100%; max-height: 68vh; background: white; cursor: crosshair; }
+    .detail-side { padding: 14px; border-left: 1px solid var(--line); }
+    .detail-side label { display: block; margin-bottom: 7px; color: var(--muted); font-size: 11px; }
+    .detail-side select { width: 100%; height: 34px; margin-bottom: 12px; border: 1px solid var(--line); border-radius: 4px; background: white; }
+    .shape-list { max-height: 34vh; overflow: auto; }
+    .shape-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px; margin: 6px 0; font-size: 11px; }
+    .shape-row select { margin: 0; }
+    .tag-row, .box-row { width: 100%; padding: 8px; margin: 4px 0; border: 1px solid var(--line); border-left: 5px solid var(--tag-color, #647572); border-radius: 4px; background: white; text-align: left; overflow-wrap: anywhere; font-size: 11px; }
+    .tag-row[aria-pressed="true"], .box-row[aria-pressed="true"] { outline: 2px solid var(--tag-color, var(--ink)); background: #edf3fa; }
+    .tag-row small, .box-row small { display: block; margin-top: 4px; }
+    .tag-navigation, .annotation-modes { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0; }
+    .annotation-modes button[aria-pressed="true"] { background: var(--high-bg); border-color: var(--high); }
+    #tag-list { max-height: 23vh; overflow-y: auto; }
+    #box-selection, #tag-message { margin: 8px 0; font-size: 12px; overflow-wrap: anywhere; }
+    #tag-message { color: var(--low); }
+    [hidden] { display: none !important; }
+    .detail-modes { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+    .detail-modes button[aria-pressed="true"] { background: var(--high-bg); border-color: var(--high); }
+    .detail-side h3 { margin: 0 0 12px; font-size: 14px; }
+    .object-list { max-height: 36vh; overflow-y: auto; }
+    .object-row { padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .object-row label { display: flex; align-items: flex-start; gap: 6px; overflow-wrap: anywhere; }
+    .object-row select { margin: 2px 0 0; }
+    .object-row small { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    #object-reviewer { width: 100%; min-width: 0; height: 34px; margin-bottom: 10px; padding: 0 7px; border: 1px solid var(--line); border-radius: 4px; }
+    #object-message { min-height: 32px; margin: 8px 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .tile-actions { flex-wrap: wrap; }
+    .detail-head h2 { overflow-wrap: anywhere; min-width: 0; }
+    .detail-foot { flex-wrap: wrap; }
+    .detail-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 14px; border-top: 1px solid var(--line); }
+    .detail-foot span { color: var(--muted); font-size: 11px; }
+    #save-object-review { margin-left: auto; }
+    .empty-state { grid-column: 1 / -1; padding: 42px 20px; color: var(--muted); border: 1px dashed var(--line); text-align: center; }
+    @media (max-width: 1050px) { .gallery { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 760px) {
+      .toolbar { flex-wrap: wrap; }
+      .toolbar > div { max-width: 100%; }
+      .intro { display: block; }
+      .summary { margin-top: 14px; }
+      .gallery { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .publish { grid-template-columns: 1fr 1fr; }
+      .detail-body { grid-template-columns: 1fr; }
+      .detail-side { border-top: 1px solid var(--line); border-left: 0; }
+    }
+    @media (max-width: 480px) {
+      .topbar { padding: 12px 14px; }
+      main { padding: 20px 10px 40px; }
+      h1 { font-size: 25px; }
+      .gallery { gap: 7px; }
+      .tile-head { padding-inline: 7px; }
+      .thumb-wrap { padding-inline: 6px; }
+      .reasons { padding-inline: 7px; }
+      .tile-actions { padding-inline: 7px; }
+      .publish { grid-template-columns: 1fr; }
+      .confirm { white-space: normal; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">SAM3 / CAPTURE DATA</div>
+    <div class="server-state">ローカルレビュー</div>
+  </header>
+  <main>
+    <section class="intro">
+      <div>
+        <h1>推論レビュー</h1>
+        <p class="subtitle">一覧で全体を確認し、要注意画像だけ詳細を開いて修正します。</p>
+      </div>
+      <div class="summary" id="summary"></div>
+    </section>
+    <section class="toolbar">
+      <label class="session-picker" for="date-select">撮影日
+        <select id="date-select" aria-label="撮影日"></select>
+      </label>
+      <label class="session-picker" for="session-select">確認するセッション
+        <select id="session-select" aria-label="確認するセッション"></select>
+      </label>
+      <div class="filters" role="group" aria-label="信頼度フィルター">
+        <button class="filter" data-filter="all" aria-pressed="true">すべて</button>
+        <button class="filter" data-filter="low" aria-pressed="false">低</button>
+        <button class="filter" data-filter="medium" aria-pressed="false">中</button>
+        <button class="filter" data-filter="high" aria-pressed="false">高</button>
+        <button class="filter" data-filter="unchecked" aria-pressed="false">未確認</button>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="toolbar-note" id="progress-note"></div>
+        <button class="small-button" id="confirm-high">高信頼度を一括確認済みにする</button>
+      </div>
+    </section>
+    <section class="publish" aria-label="一括公開">
+      <input id="reviewer" type="text" autocomplete="off" placeholder="確認担当者">
+      <span class="publish-destination" id="publish-destination"></span>
+      <label class="confirm"><input id="confirm-complete" type="checkbox">選択セッションの全画像を確認済み</label>
+      <button class="primary" id="publish-button">YOLO用に一括公開</button>
+    </section>
+    <p class="status-note">信頼度は推論の確認優先度（3段階）です。青い「承認済」は保存済みの承認状態を示し、一覧確認・YOLO公開とは別です。</p>
+    <div id="notice" role="status"></div>
+    <section class="gallery" id="gallery" aria-live="polite"></section>
+  </main>
+  <dialog id="detail-dialog">
+    <div class="detail-head">
+      <h2 id="detail-title">画像詳細</h2>
+      <button class="secondary" id="close-detail">閉じる</button>
+    </div>
+    <div class="detail-modes" role="group" aria-label="確認対象">
+      <button class="small-button" id="mode-yolo" aria-pressed="true">YOLO注釈</button>
+      <button class="small-button" id="mode-dino" aria-pressed="false">DINO原本確認</button>
+    </div>
+    <div class="detail-body">
+      <div class="canvas-stage"><canvas id="detail-canvas"></canvas></div>
+      <aside class="detail-side">
+        <div id="yolo-controls">
+        <div class="annotation-modes" role="group" aria-label="YOLO操作モード">
+          <button class="small-button" id="confirm-mode" aria-pressed="true">確認モード</button>
+          <button class="small-button" id="draw-mode" aria-pressed="false">描画モード</button>
+        </div>
+        <p class="subtitle" id="annotation-instruction">タグまたはbboxをクリックして対応を確認します。重なったbboxは再クリックで切り替えます。</p>
+        <h3>器具タグ（UID / 個体番号）</h3>
+        <div id="tag-list"></div>
+        <div class="tag-navigation">
+          <button class="small-button" id="previous-tag">前のタグ</button>
+          <button class="small-button" id="next-tag">次のタグ</button>
+        </div>
+        <p id="box-selection" role="status"></p>
+        <button class="small-button" id="adopt-box">選択タグにこのbboxを採用</button>
+        <button class="small-button" id="release-box">採用を解除して候補に戻す</button>
+        <p id="tag-message" role="alert"></p>
+        <label>bbox一覧（未採用候補は学習対象外）</label>
+        <div class="shape-list" id="shape-list"></div>
+        <label class="confirm"><input id="detail-reviewed" type="checkbox">この画像を確認済みにする</label>
+        </div>
+        <div id="dino-controls" hidden>
+          <h3>SAM3推論結果</h3>
+          <p class="subtitle">器具タグを選び、bbox・maskを確認して候補を一つ採用します。低スコアでも手動で対応を確定できます。</p>
+          <div id="dino-tag-list"></div>
+          <div class="tag-navigation">
+            <button class="small-button" id="previous-dino-tag">前のタグ</button>
+            <button class="small-button" id="next-dino-tag">次のタグ</button>
+          </div>
+          <button class="small-button" id="adopt-dino-box">選択タグにこのDINO候補を採用</button>
+          <button class="small-button" id="reject-unused-dino">未判定候補を使わないにする</button>
+          <p class="subtitle">各物体の推論maskを確認してください。mask PNGは「保存して次へ」で承認するまで保存されません。</p>
+          <div class="object-list" id="object-list"></div>
+          <p id="object-message" role="status"></p>
+          <p class="subtitle">「保存して次へ」で全物体の判定と画像全体の承認を確定します。YOLO公開は一覧画面で別途行います。</p>
+        </div>
+      </aside>
+    </div>
+    <div class="detail-foot">
+      <span id="detail-hint">修正後は保存し、一覧の確認状態を付けてください。</span>
+      <button class="primary" id="save-detail">修正を保存</button>
+      <button class="primary" id="save-object-review" hidden>保存して次へ</button>
+    </div>
+  </dialog>
+  <dialog id="discard-dialog">
+    <p>未保存の変更がある。</p>
+    <button class="secondary" id="continue-review">確認を続ける</button>
+    <button class="primary" id="discard-review">変更を破棄して閉じる</button>
+  </dialog>
+  <dialog id="overwrite-mask-dialog">
+    <p>保存済みmaskがある。上書きしますか？</p>
+    <button class="secondary" id="keep-saved-mask">No（保存せず戻る）</button>
+    <button class="primary" id="overwrite-saved-mask">Yes（上書きして保存）</button>
+  </dialog>
+  <script src="/tag_review.js"></script>
+  <script>
+    const gallery = document.querySelector("#gallery");
+    const notice = document.querySelector("#notice");
+    const progressNote = document.querySelector("#progress-note");
+    const detailDialog = document.querySelector("#detail-dialog");
+    const detailCanvas = document.querySelector("#detail-canvas");
+    const context = detailCanvas.getContext("2d");
+    const reasonText = {
+      no_detection: "検出なし", unresolved_candidate: "UID未確定", missing_tag: "対応タグなし",
+      missing_score: "スコア情報なし", missing_tag_points: "位置情報なし", tag_point_outside_bbox: "タグ位置がbbox外",
+      score_below_medium: "スコア低", score_medium: "スコア中", estimated_tag_point: "推定位置を含む",
+      unmatched_tag: "未対応タグ", unmatched_candidate: "未対応候補", ambiguous: "対応が曖昧",
+      pointless_tag: "タグ位置なし", estimated_center: "中心位置が推定値"
+    };
+    let items = [];
+    let sessions = [];
+    let selectedSession = "";
+    let selectedDate = "";
+    let selectedItem = null;
+    let tagEditor = null;
+    let dinoEditor = null;
+    let tagEdits = false;
+    let currentFilter = "all";
+    let image = null;
+    let dragStart = null;
+    let previewPoint = null;
+    let detailMode = "yolo";
+    let focusedObject = null;
+    let maskOverlay = null;
+    let maskRequest = 0;
+    let viewedObjects = new Set();
+    let savingReview = false;
+
+    function showNotice(message, kind = "") {
+      notice.textContent = message;
+      notice.className = kind;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[character]));
+    }
+
+    function reasonsFor(item) {
+      return item.reasons.map(reason => reasonText[reason.split(":")[0]] || reason).join(" / ") || "タグ位置とスコアを確認済み";
+    }
+
+    async function request(url, method = "GET", body = undefined) {
+      const response = await fetch(url, {
+        method,
+        headers: body === undefined ? {} : {"Content-Type":"application/json"},
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      const data = response.headers.get("content-type")?.includes("json") ? await response.json() : null;
+      if (!response.ok) throw new Error(data?.error || `HTTP ${response.status}`);
+      return data;
+    }
+
+    function drawImage(canvas, item, sourceImage, detailed = false) {
+      const width = sourceImage.naturalWidth;
+      const height = sourceImage.naturalHeight;
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, width, height);
+      ctx.drawImage(sourceImage, 0, 0, width, height);
+      const originalMode = detailed && detailMode === "dino";
+      if (originalMode && maskOverlay) ctx.drawImage(maskOverlay, 0, 0, width, height);
+      const tags = item.tags.filter(tag => tag.visible);
+      const shapes = originalMode ? (item.objects || []).map(object => ({points: [[object.bbox[0], object.bbox[1]], [object.bbox[2], object.bbox[3]]], label: object.instrument_uid || "__unresolved__", tag_assignment: object, group_id: object.object_index}))
+        : detailed && tagEditor ? tagEditor.entries.map(entry => entry.shape) : [...item.annotation.shapes, ...(item.annotation.review_candidates || [])];
+      for (const [index, shape] of shapes.entries()) {
+        const [[x1, y1], [x2, y2]] = shape.points;
+        const x = Math.min(x1, x2), y = Math.min(y1, y2);
+        const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+        const tag = detailed && !originalMode && tagEditor ? tagEditor.entries[index].tag : TagReview.identity(shape, tags);
+        const tagIndex = tag ? tags.findIndex(candidate => TagReview.key(candidate) === TagReview.key(tag)) : -1;
+        const color = tagIndex < 0 ? "#647572" : TagReview.color(tagIndex);
+        const selected = originalMode ? shape.group_id === focusedObject : detailed && tagEditor?.selectedBox === index;
+        ctx.globalAlpha = originalMode ? (selected ? 1 : 0.3) : detailed && tagEditor?.selectedBox !== null && !selected ? 0.4 : 1;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = detailed ? Math.max(selected ? 5 : 2, width / 500) : Math.max(2, width / 300);
+        ctx.setLineDash(tag ? [] : [8, 5]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+        ctx.font = `${Math.max(12, width / (detailed ? 55 : 34))}px sans-serif`;
+        const label = `${TagReview.boxName(shape, index)} · ${tag ? `タグ${tagIndex + 1} ${tag.instrument_uid}/${tag.instance_no}` : "未対応・未採用"}`;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 3;
+        ctx.strokeText(label, x + 3, Math.max(14, y - 4));
+        ctx.fillStyle = color;
+        ctx.fillText(label, x + 3, Math.max(14, y - 4));
+        ctx.globalAlpha = 1;
+      }
+      // 物体(タグ)ごとに色を変え、番号ラベルを添えて点と物体の対応を判別可能にする。
+      (originalMode ? [] : tags).forEach((tag, tagIndex) => {
+        const color = TagReview.color(tagIndex);
+        const radius = detailed ? Math.max(4, width / 180) : Math.max(3, width / 220);
+        let labelPoint = null;
+        for (const key of ["center", "end_a", "end_b"]) {
+          const point = tag[key];
+          if (!point) continue;
+          const px = point.x * width, py = point.y * height;
+          if (!labelPoint || key === "center") labelPoint = {x: px, y: py};
+          ctx.beginPath();
+          ctx.arc(px, py, radius, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+          ctx.strokeStyle = point.status === "visible" ? "#ffffff" : "#172b29";
+          ctx.lineWidth = detailed ? 2 : 1;
+          ctx.stroke();
+        }
+        if (labelPoint) {
+          ctx.font = `bold ${Math.max(11, width / (detailed ? 60 : 38))}px sans-serif`;
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = "#172b29";
+          ctx.strokeText(String(tagIndex + 1), labelPoint.x + radius + 2, labelPoint.y - radius);
+          ctx.fillStyle = color;
+          ctx.fillText(String(tagIndex + 1), labelPoint.x + radius + 2, labelPoint.y - radius);
+        }
+      });
+      if (detailed && dragStart && previewPoint) {
+        ctx.strokeStyle = "#172b29";
+        ctx.setLineDash([7, 5]);
+        ctx.lineWidth = Math.max(2, width / 500);
+        ctx.strokeRect(dragStart.x, dragStart.y, previewPoint.x - dragStart.x, previewPoint.y - dragStart.y);
+        ctx.setLineDash([]);
+      }
+    }
+
+    function renderSummary() {
+      const sessionItems = items.filter(item => item.session_id === selectedSession);
+      const counts = {high: 0, medium: 0, low: 0};
+      for (const item of sessionItems) counts[item.confidence] += 1;
+      document.querySelector("#summary").innerHTML = `
+        <div class="metric"><strong>${sessionItems.length}</strong><span>画像</span></div>
+        <div class="metric"><strong>${counts.low}</strong><span>要注意</span></div>
+        <div class="metric"><strong>${counts.medium}</strong><span>通常確認</span></div>
+        <div class="metric"><strong>${counts.high}</strong><span>軽確認</span></div>`;
+      const checked = sessionItems.filter(item => item.reviewed || item.approved).length;
+      progressNote.textContent = `確認済み ${checked} / ${sessionItems.length}`;
+      document.querySelector("#publish-destination").textContent = selectedSession
+        ? `公開先: exports/${selectedSession}`
+        : "公開するセッションがありません";
+      document.querySelector("#publish-button").disabled = !selectedSession;
+    }
+
+    function renderReviewStatus(item) {
+      const objects = item.objects || [];
+      const accepted = objects.filter(object => object.dino_status === "accepted").length;
+      const rejected = objects.filter(object => object.dino_status === "rejected").length;
+      const pending = objects.length - accepted - rejected;
+      // 画像承認だけでDINOを承認済みにせず、保存済みの物体採否も照合する。
+      const dinoApproved = (item.dino_approved ?? item.approved) && accepted > 0 && pending === 0;
+      let dinoLabel = "未承認";
+      if (!objects.length) dinoLabel = "対象なし";
+      else if (pending === objects.length) dinoLabel = "未判定";
+      else if (pending > 0) dinoLabel = "判定途中";
+      else if (dinoApproved) dinoLabel = "承認済";
+      else if (rejected === objects.length) dinoLabel = "判定済（採用なし）";
+      return `
+        <div class="review-status" aria-label="モデル別の承認状況">
+          <div class="review-status-row"><strong>YOLO</strong><span class="approval-badge ${item.approved ? "approved" : ""}">${item.approved ? "✓ 承認済" : "未承認"}</span></div>
+          <div class="review-status-row"><strong>DINO</strong><span class="approval-badge ${dinoApproved ? "approved" : ""}">${dinoApproved ? "✓ " : ""}${dinoLabel}</span></div>
+          <div class="dino-counts">DINO物体: 採用 ${accepted} / 不採用 ${rejected} / 未判定 ${pending}</div>
+        </div>`;
+    }
+
+    function renderGallery() {
+      renderSummary();
+      const sessionItems = items.filter(item => item.session_id === selectedSession);
+      const shown = sessionItems.filter(item => currentFilter === "all" || (currentFilter === "unchecked" ? !item.reviewed && !item.approved : item.confidence === currentFilter));
+      if (!shown.length) {
+        gallery.innerHTML = `<div class="empty-state">表示する画像はありません。</div>`;
+        return;
+      }
+      gallery.innerHTML = shown.map(item => `
+        <article class="tile" data-revision="${item.revision}">
+          <div class="tile-head">
+            <div class="tile-title"><strong>${escapeHtml(item.image_id)}</strong><small>${escapeHtml(item.capture_date)} / ${escapeHtml(item.session_id)} · ${item.width} × ${item.height}</small><small class="tag-count">物体(タグ) ${item.tags.filter(tag => tag.visible !== false).length}点 / 検出 ${item.annotation.shapes.length}件</small></div>
+            <div class="confidence ${item.confidence}">
+              <span>信頼度 ${item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}</span>
+              <span class="confidence-meter" aria-hidden="true"><i class="filled"></i><i class="${item.confidence !== "low" ? "filled" : ""}"></i><i class="${item.confidence === "high" ? "filled" : ""}"></i></span>
+            </div>
+          </div>
+          <div class="thumb-wrap"><canvas class="thumb" aria-label="${escapeHtml(item.image_id)}の推論画像"></canvas></div>
+          ${renderReviewStatus(item)}
+          <div class="reasons">${escapeHtml(reasonsFor(item))}</div>
+          <div class="tile-actions">
+            <label><input class="reviewed" type="checkbox" ${item.reviewed || item.approved ? "checked" : ""} ${item.approved ? "disabled" : ""}>一覧確認済</label>
+            <button class="small-button detail-button">画像を確認・修正</button>
+            <button class="small-button dino-button" ${(item.objects || []).length ? "" : "disabled"}>DINO物体確認</button>
+          </div>
+          <div class="exception-row"><input class="exception-note" type="text" value="${escapeHtml(item.exception_note || "")}" placeholder="タグ数が異なる場合の理由 (任意)"></div>
+          <label class="empty-check ${item.annotation.shapes.length === 0 ? "visible" : ""}"><input class="allow-empty" type="checkbox" ${item.allow_empty ? "checked" : ""}>真の負例として空で承認</label>
+        </article>`).join("");
+      for (const tile of gallery.querySelectorAll(".tile")) {
+        const item = items.find(candidate => candidate.revision === tile.dataset.revision);
+        const canvas = tile.querySelector("canvas");
+        const thumbImage = new Image();
+        thumbImage.onload = () => drawImage(canvas, item, thumbImage);
+        thumbImage.src = item.image_url;
+        tile.querySelector(".reviewed").addEventListener("change", event => updateReviewed(item, event.currentTarget.checked));
+        tile.querySelector(".detail-button").addEventListener("click", () => openDetail(item));
+        tile.querySelector(".dino-button").addEventListener("click", () => openDetail(item, "dino"));
+        tile.querySelector(".exception-note").addEventListener("change", event => updateReviewState(item, {exception_note: event.currentTarget.value}));
+        tile.querySelector(".allow-empty").addEventListener("change", event => updateReviewState(item, {allow_empty: event.currentTarget.checked}));
+      }
+    }
+
+    async function updateReviewed(item, reviewed) {
+      try {
+        await request("/api/reviewed", "POST", {revision: item.revision, reviewed});
+        item.reviewed = reviewed;
+        renderSummary();
+      } catch (error) {
+        showNotice(error.message, "error");
+      }
+    }
+
+    async function updateReviewState(item, state) {
+      try {
+        await request("/api/reviewed", "POST", {revision: item.revision, ...state});
+        Object.assign(item, state);
+      } catch (error) {
+        showNotice(error.message, "error");
+      }
+    }
+
+    function openDetail(item, mode = "yolo") {
+      if (mode === "dino" && !document.querySelector("#reviewer").value.trim()) {
+        showNotice("先に画面上部の確認担当者を入力してください。", "error");
+        document.querySelector("#reviewer").focus();
+        return;
+      }
+      selectedItem = structuredClone(item);
+      tagEditor = new TagReview.Editor(selectedItem);
+      dinoEditor = new TagReview.DinoEditor(selectedItem);
+      tagEdits = false;
+      document.querySelector("#tag-message").textContent = "";
+      if (tagEditor.selectedTag !== null) tagEditor.selectedBox = tagEditor.assigned(tagEditor.selectedTag)[0] ?? null;
+      focusedObject = selectedItem.objects?.[0]?.object_index ?? null;
+      viewedObjects = new Set();
+      maskOverlay = null;
+      document.querySelector("#detail-title").textContent = `${item.capture_date} / ${item.image_id} / ${item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}信頼度`;
+      document.querySelector("#detail-reviewed").checked = item.reviewed || item.approved;
+      image = new Image();
+      image.onload = () => drawImage(detailCanvas, selectedItem, image, true);
+      image.src = item.image_url;
+      renderShapeList();
+      setDetailMode(mode);
+      detailDialog.showModal();
+    }
+
+    function setDetailMode(mode) {
+      // 両モードの未保存編集が混ざり、どちらも確定できなくなることを防ぐ。
+      if (detailDialog.open && mode !== detailMode) {
+        if (hasUnsavedDetail()) {
+          const message = "未保存の変更がある。現在のモードで保存するか、閉じて変更を破棄してください。";
+          document.querySelector(detailMode === "dino" ? "#object-message" : "#detail-hint").textContent = message;
+          return;
+        }
+        if (mode === "dino" && !document.querySelector("#reviewer").value.trim()) {
+          document.querySelector("#detail-hint").textContent = "一度閉じて、画面上部の確認担当者を入力してください。";
+          return;
+        }
+      }
+      detailMode = mode;
+      dragStart = null;
+      previewPoint = null;
+      document.querySelector("#mode-yolo").setAttribute("aria-pressed", String(mode === "yolo"));
+      document.querySelector("#mode-dino").setAttribute("aria-pressed", String(mode === "dino"));
+      document.querySelector("#yolo-controls").hidden = mode !== "yolo";
+      document.querySelector("#dino-controls").hidden = mode !== "dino";
+      document.querySelector("#save-detail").hidden = mode !== "yolo";
+      document.querySelector("#save-object-review").hidden = mode !== "dino";
+      document.querySelector("#detail-hint").hidden = mode === "dino";
+      detailCanvas.style.cursor = mode === "dino" ? "pointer" : tagEditor?.mode === "draw" ? "crosshair" : "pointer";
+      if (mode === "dino") {
+        // 既存の不採用は変えず、未判定かつ器具対応済みの物体だけを初期選択する。
+        for (const object of selectedItem.objects || []) {
+          if (object.dino_status === "pending" && object.instrument_uid && object.instance_no !== null) object.dino_status = "accepted";
+        }
+        const assigned = dinoEditor.assigned(dinoEditor.selectedTag)[0];
+        if (assigned) focusedObject = assigned.object_index;
+        renderObjectList();
+        loadObjectMask();
+      }
+      if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
+    }
+
+    function renderObjectList() {
+      const objects = selectedItem.objects || [];
+      const tagList = document.querySelector("#dino-tag-list");
+      tagList.innerHTML = dinoEditor.tags.map((tag, index) => {
+        const assigned = dinoEditor.assigned(index);
+        return `<button class="tag-row" data-dino-tag="${index}" aria-pressed="${dinoEditor.selectedTag === index}" style="--tag-color:${TagReview.color(index)}">
+          タグ ${index + 1} · ${escapeHtml(tag.instrument_name || tag.instrument_uid)} · ${escapeHtml(tag.instrument_uid)} / 個体 ${tag.instance_no}
+          <small>${assigned.length ? assigned.map(object => `Box ${String(object.object_index).padStart(3, "0")}`).join(", ") + "：採用" : "未採用：候補を選択してください"}</small></button>`;
+      }).join("") || `<p class="subtitle">可視タグがありません。</p>`;
+      for (const button of tagList.querySelectorAll("[data-dino-tag]")) button.addEventListener("click", () => selectDinoTag(Number(button.dataset.dinoTag)));
+      document.querySelector("#previous-dino-tag").disabled = dinoEditor.selectedTag === null || dinoEditor.selectedTag === 0;
+      document.querySelector("#next-dino-tag").disabled = dinoEditor.selectedTag === null || dinoEditor.selectedTag === dinoEditor.tags.length - 1;
+      document.querySelector("#adopt-dino-box").disabled = dinoEditor.selectedTag === null || focusedObject === null;
+      document.querySelector("#object-list").innerHTML = objects.map(object => `
+        <div class="object-row" data-object="${object.object_index}" style="border-left:4px solid ${object.instrument_uid ? TagReview.color(dinoEditor.tags.findIndex(tag => tag.instrument_uid === object.instrument_uid && tag.instance_no === object.instance_no)) : "#647572"};padding-left:6px;background:${object.object_index === focusedObject ? "#edf3fa" : "transparent"}">
+          <label><input type="radio" name="focused-object" value="${object.object_index}" ${object.object_index === focusedObject ? "checked" : ""}>
+            <span>Box ${String(object.object_index).padStart(3, "0")} · ${escapeHtml(object.instrument_uid || "器具未確定")}${object.instance_no === null ? "" : ` / 個体 ${object.instance_no}`}</span></label>
+          <small>SAM3 ${object.sam3_score.toFixed(3)}${object.reviewer ? ` · ${escapeHtml(object.reviewer)}` : ""} · ${object.saved_mask_exists ? "保存済みmaskあり" : "保存済みmaskなし"} · ${viewedObjects.has(object.object_index) ? "今回mask確認済み" : "今回mask未確認"}</small>
+          <select class="object-tag" aria-label="Box ${String(object.object_index).padStart(3, "0")}の器具タグ">
+            <option value="">未対応（採用解除）</option>
+            ${dinoEditor.tags.map((tag, index) => `<option value="${index}" ${tag.instrument_uid === object.instrument_uid && tag.instance_no === object.instance_no ? "selected" : ""}>タグ ${index + 1} · ${escapeHtml(tag.instrument_uid)} / 個体 ${tag.instance_no}</option>`).join("")}
+          </select>
+          <select class="object-status" aria-label="物体${String(object.object_index).padStart(3, "0")}の採否">
+            <option value="pending" disabled ${object.dino_status === "pending" ? "selected" : ""}>未判定</option>
+            <option value="accepted" ${object.dino_status === "accepted" ? "selected" : ""} ${object.instrument_uid && object.instance_no !== null ? "" : "disabled"}>DINOに使う</option>
+            <option value="rejected" ${object.dino_status === "rejected" ? "selected" : ""}>DINOに使わない</option>
+          </select>
+        </div>`).join("") || `<p class="subtitle">推論物体がありません。</p>`;
+      for (const row of document.querySelectorAll(".object-row")) {
+        row.querySelector("input").addEventListener("change", () => {
+          focusedObject = Number(row.dataset.object);
+          dinoEditor.select(objects.find(object => object.object_index === focusedObject));
+          renderObjectList();
+          loadObjectMask();
+        });
+        row.querySelector(".object-tag").addEventListener("change", event => {
+          const object = objects.find(value => value.object_index === Number(row.dataset.object));
+          if (event.currentTarget.value === "") {
+            object.instrument_uid = null;
+            object.instance_no = null;
+            object.dino_status = "rejected";
+          } else {
+            dinoEditor.selectedTag = Number(event.currentTarget.value);
+            if (!adoptDinoObject(object)) { renderObjectList(); return; }
+          }
+          focusedObject = object.object_index;
+          renderObjectList();
+          loadObjectMask();
+        });
+        row.querySelector(".object-status").addEventListener("change", () => {
+          const object = objects.find(object => object.object_index === Number(row.dataset.object));
+          if (row.querySelector(".object-status").value === "accepted") {
+            dinoEditor.select(object);
+            if (!adoptDinoObject(object)) { renderObjectList(); return; }
+          } else object.dino_status = row.querySelector(".object-status").value;
+          focusedObject = Number(row.dataset.object);
+          renderObjectList();
+          loadObjectMask();
+        });
+      }
+    }
+
+    function selectDinoTag(index) {
+      dinoEditor.selectedTag = index;
+      const assigned = dinoEditor.assigned(index)[0];
+      if (assigned) focusedObject = assigned.object_index;
+      renderObjectList();
+      loadObjectMask();
+    }
+
+    function adoptDinoObject(object) {
+      if (dinoEditor.needsReplacement(object) && !window.confirm("このタグの既存DINO候補を解除し、選択候補へ付け替えますか？")) return false;
+      dinoEditor.adopt(object);
+      return true;
+    }
+
+    document.querySelector("#previous-dino-tag").addEventListener("click", () => selectDinoTag(dinoEditor.selectedTag - 1));
+    document.querySelector("#next-dino-tag").addEventListener("click", () => selectDinoTag(dinoEditor.selectedTag + 1));
+    document.querySelector("#adopt-dino-box").addEventListener("click", () => {
+      try {
+        const object = selectedItem.objects.find(value => value.object_index === focusedObject);
+        if (!adoptDinoObject(object)) return;
+        renderObjectList();
+        loadObjectMask();
+      } catch (error) {
+        document.querySelector("#object-message").textContent = error.message;
+      }
+    });
+    document.querySelector("#reject-unused-dino").addEventListener("click", () => {
+      for (const object of selectedItem.objects) if (object.dino_status === "pending") object.dino_status = "rejected";
+      renderObjectList();
+    });
+
+    function loadObjectMask() {
+      const token = ++maskRequest;
+      maskOverlay = null;
+      document.querySelector("#save-object-review").disabled = true;
+      const object = selectedItem.objects?.find(item => item.object_index === focusedObject);
+      document.querySelector("#object-message").textContent = object ? "確認用maskを生成・読み込み中（必要に応じてSAM3推論を実行）" : "推論物体がありません。";
+      if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
+      if (!object) {
+        document.querySelector("#save-object-review").disabled = false;
+        return;
+      }
+      const overlay = new Image();
+      overlay.onload = () => {
+        if (token !== maskRequest) return;
+        maskOverlay = overlay;
+        viewedObjects.add(object.object_index);
+        renderObjectList();
+        document.querySelector("#save-object-review").disabled = false;
+        document.querySelector("#object-message").textContent = `mask確認 ${viewedObjects.size} / ${selectedItem.objects.length}物体 · 保存して次へでPNG保存`;
+        if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
+      };
+      overlay.onerror = () => {
+        if (token === maskRequest) document.querySelector("#object-message").textContent = "確認用maskを生成・読み込みできません。推論設定またはサーバーのエラーを確認してください。";
+      };
+      overlay.src = object.mask_url;
+    }
+
+    document.querySelector("#mode-yolo").addEventListener("click", () => setDetailMode("yolo"));
+    document.querySelector("#mode-dino").addEventListener("click", () => setDetailMode("dino"));
+    document.querySelector("#keep-saved-mask").addEventListener("click", () => document.querySelector("#overwrite-mask-dialog").close("no"));
+    document.querySelector("#overwrite-saved-mask").addEventListener("click", () => document.querySelector("#overwrite-mask-dialog").close("yes"));
+
+    async function confirmMaskOverwrite() {
+      const dialog = document.querySelector("#overwrite-mask-dialog");
+      dialog.returnValue = "";
+      const answer = new Promise(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "yes"), {once: true}));
+      dialog.showModal();
+      return answer;
+    }
+
+    document.querySelector("#save-object-review").addEventListener("click", async () => {
+      if (savingReview) return;
+      const controls = [...detailDialog.querySelectorAll("button, input, select")].map(element => [element, element.disabled]);
+      let saved = false;
+      let nextRevision;
+      try {
+        const reviewer = document.querySelector("#reviewer").value.trim();
+        if (!reviewer) throw new Error("一度閉じて、画面上部の確認担当者を入力してください。未保存の変更がある場合は破棄の確認が表示されます。");
+        const objects = selectedItem.objects || [];
+        if (objects.some(object => object.dino_status === "pending")) throw new Error("未判定の物体がある。「使う／使わない」を選択してください");
+        if (objects.some(object => !viewedObjects.has(object.object_index))) throw new Error("各物体を選択し、すべての原本マスクを確認してください");
+        const current = items.find(item => item.revision === selectedItem.revision);
+        if (JSON.stringify(current.annotation) !== JSON.stringify(selectedItem.annotation)) throw new Error("YOLO矩形に未保存の変更がある。先に「修正を保存」を実行してください");
+        savingReview = true;
+        for (const [element] of controls) element.disabled = true;
+        // 開いてから他の保存が行われた場合も、最新の存在情報で確認する。
+        const latest = (await request("/api/items")).items.find(item => item.revision === selectedItem.revision);
+        if (!latest) throw new Error("レビュー版が更新されました。画面を開き直してください");
+        const overwriteMasks = latest.objects.some(object => object.saved_mask_exists);
+        if (overwriteMasks && !await confirmMaskOverwrite()) {
+          document.querySelector("#object-message").textContent = "保存を中止しました。既存maskと判定は変更していません。";
+          return;
+        }
+        await request("/api/complete-review", "POST", {revision: selectedItem.revision, reviewer, confirm_complete: true,
+          overwrite_masks: overwriteMasks,
+          decisions: objects.map(object => ({object_index: object.object_index, status: object.dino_status})),
+          assignments: objects.map(object => ({object_index: object.object_index, instrument_uid: object.instrument_uid, instance_no: object.instance_no})),
+          allow_empty: selectedItem.allow_empty, exception_note: selectedItem.exception_note});
+        // 成功済みの採否を保持し、一覧の再読込失敗時も保存漏れと誤認させない。
+        current.objects = structuredClone(objects);
+        current.dino_approved = true;
+        current.reviewed = true;
+        const sessionItems = items.filter(item => item.session_id === selectedItem.session_id);
+        nextRevision = sessionItems[sessionItems.findIndex(item => item.revision === selectedItem.revision) + 1]?.revision;
+        saved = true;
+      } catch (error) {
+        document.querySelector("#object-message").textContent = error.message;
+      } finally {
+        savingReview = false;
+        for (const [element, disabled] of controls) element.disabled = disabled;
+      }
+      if (saved) {
+        detailDialog.close();
+        if (!await loadItems()) return;
+        const next = items.find(item => item.revision === nextRevision);
+        if (next) openDetail(next, "dino");
+        else showNotice("セッション末尾まで保存しました。YOLO公開は一覧画面から実行してください。", "success");
+      }
+    });
+
+    function renderShapeList() {
+      if (!tagEditor) return;
+      const list = document.querySelector("#shape-list");
+      const tags = document.querySelector("#tag-list");
+      tags.innerHTML = tagEditor.tags.map((tag, index) => {
+        const boxes = tagEditor.assigned(index);
+        return `<button class="tag-row" data-tag="${index}" aria-pressed="${tagEditor.selectedTag === index}" style="--tag-color:${TagReview.color(index)}">
+          ${escapeHtml(tagEditor.tagName(index))}<small>${boxes.length ? boxes.map(box => escapeHtml(TagReview.boxName(tagEditor.entries[box].shape, box))).join(", ") + (boxes.length > 1 ? "：重複対応・再採用が必要" : "：採用済み") : "未対応：候補を採用、または描画してください"}</small></button>`;
+      }).join("") || `<p class="subtitle">可視タグがありません。撮影側でタグを確認してください。</p>`;
+      list.innerHTML = tagEditor.entries.map(({shape, tag}, index) => {
+        const tagIndex = tag ? tagEditor.tags.findIndex(value => TagReview.key(value) === TagReview.key(tag)) : -1;
+        const score = TagReview.score(shape);
+        return `<button class="box-row" data-box="${index}" aria-pressed="${tagEditor.selectedBox === index}" style="--tag-color:${tagIndex < 0 ? "#647572" : TagReview.color(tagIndex)}">
+          ${escapeHtml(TagReview.boxName(shape, index))}<small>${tag ? escapeHtml(tagEditor.tagName(tagIndex)) + "：採用" : "未対応・未採用"}${score == null ? "" : ` · score ${score.toFixed(3)}`}</small></button>`;
+      }).join("") || `<p class="subtitle">bboxがありません。タグを選んで描画してください。</p>`;
+      for (const button of tags.querySelectorAll("[data-tag]")) button.addEventListener("click", () => selectTag(Number(button.dataset.tag)));
+      for (const button of list.querySelectorAll("[data-box]")) button.addEventListener("click", () => {
+        tagEditor.selectBox(Number(button.dataset.box));
+        refreshTagReview();
+      });
+      const entry = tagEditor.entries[tagEditor.selectedBox];
+      document.querySelector("#box-selection").textContent = entry
+        ? `${TagReview.boxName(entry.shape, tagEditor.selectedBox)} → ${entry.tag ? `${entry.tag.instrument_uid} / 個体 ${entry.tag.instance_no}（採用）` : "未対応・未採用"}`
+        : "画像のbboxまたは右の一覧から選択してください。";
+      document.querySelector("#adopt-box").disabled = !entry || tagEditor.selectedTag === null;
+      document.querySelector("#release-box").disabled = !entry?.tag;
+      document.querySelector("#draw-mode").disabled = tagEditor.selectedTag === null;
+      document.querySelector("#previous-tag").disabled = tagEditor.selectedTag === null || tagEditor.selectedTag === 0;
+      document.querySelector("#next-tag").disabled = tagEditor.selectedTag === null || tagEditor.selectedTag === tagEditor.tags.length - 1;
+      for (const mode of ["confirm", "draw"]) document.querySelector(`#${mode}-mode`).setAttribute("aria-pressed", String(tagEditor.mode === mode));
+      document.querySelector("#annotation-instruction").textContent = tagEditor.mode === "draw"
+        ? `${tagEditor.tagName(tagEditor.selectedTag)} のbboxをドラッグしてください。既存の採用bboxは確認後に置換します。`
+        : "タグまたはbboxをクリックして対応を確認します。重なったbboxは再クリックで切り替えます。";
+    }
+
+    function refreshTagReview() {
+      renderShapeList();
+      if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
+    }
+
+    function selectTag(index) {
+      tagEditor.selectedTag = index;
+      tagEditor.selectedBox = tagEditor.assigned(index)[0] ?? null;
+      refreshTagReview();
+    }
+
+    function setAnnotationMode(mode) {
+      tagEditor.mode = mode;
+      dragStart = null;
+      previewPoint = null;
+      detailCanvas.style.cursor = mode === "draw" ? "crosshair" : "pointer";
+      refreshTagReview();
+    }
+
+    function syncTagAnnotation() {
+      selectedItem.annotation = tagEditor.annotation(selectedItem.annotation);
+      tagEdits = true;
+      document.querySelector("#tag-message").textContent = "";
+      refreshTagReview();
+    }
+
+    document.querySelector("#confirm-mode").addEventListener("click", () => setAnnotationMode("confirm"));
+    document.querySelector("#draw-mode").addEventListener("click", () => setAnnotationMode("draw"));
+    document.querySelector("#previous-tag").addEventListener("click", () => selectTag(tagEditor.selectedTag - 1));
+    document.querySelector("#next-tag").addEventListener("click", () => selectTag(tagEditor.selectedTag + 1));
+    document.querySelector("#adopt-box").addEventListener("click", () => {
+      try {
+        const index = tagEditor.selectedBox;
+        if (tagEditor.needsReplacement(index) && !window.confirm("既存のタグ対応を解除し、このbboxに付け替えますか？")) return;
+        tagEditor.adopt(index);
+        syncTagAnnotation();
+      } catch (error) {
+        document.querySelector("#tag-message").textContent = error.message;
+      }
+    });
+    document.querySelector("#release-box").addEventListener("click", () => {
+      const entry = tagEditor.entries[tagEditor.selectedBox];
+      if (entry) {
+        entry.tag = null;
+        syncTagAnnotation();
+      }
+    });
+
+    function canvasPoint(event) {
+      const bounds = detailCanvas.getBoundingClientRect();
+      return {
+        x: Math.max(0, Math.min(detailCanvas.width, (event.clientX - bounds.left) * detailCanvas.width / bounds.width)),
+        y: Math.max(0, Math.min(detailCanvas.height, (event.clientY - bounds.top) * detailCanvas.height / bounds.height))
+      };
+    }
+
+    detailCanvas.addEventListener("pointerdown", event => {
+      if (!selectedItem || !image) return;
+      if (detailMode === "dino") {
+        const point = canvasPoint(event);
+        const hits = selectedItem.objects.filter(object => point.x >= object.bbox[0] && point.x <= object.bbox[2] && point.y >= object.bbox[1] && point.y <= object.bbox[3]);
+        if (hits.length) {
+          const index = hits.findIndex(object => object.object_index === focusedObject);
+          const object = hits[(index + 1) % hits.length];
+          focusedObject = object.object_index;
+          dinoEditor.select(object);
+          renderObjectList();
+          loadObjectMask();
+        }
+        return;
+      }
+      if (tagEditor.mode === "confirm") {
+        const hits = tagEditor.hitBoxes(canvasPoint(event));
+        if (hits.length) tagEditor.selectBox(hits[(hits.indexOf(tagEditor.selectedBox) + 1) % hits.length]);
+        else tagEditor.selectedBox = null;
+        refreshTagReview();
+        return;
+      }
+      if (tagEditor.selectedTag === null) return;
+      dragStart = canvasPoint(event);
+      previewPoint = dragStart;
+      detailCanvas.setPointerCapture(event.pointerId);
+    });
+    detailCanvas.addEventListener("pointermove", event => {
+      if (!dragStart) return;
+      previewPoint = canvasPoint(event);
+      drawImage(detailCanvas, selectedItem, image, true);
+    });
+    detailCanvas.addEventListener("pointerup", event => {
+      if (!dragStart || !selectedItem) return;
+      const end = canvasPoint(event);
+      const left = Math.min(dragStart.x, end.x), top = Math.min(dragStart.y, end.y);
+      const right = Math.max(dragStart.x, end.x), bottom = Math.max(dragStart.y, end.y);
+      if (right - left >= 3 && bottom - top >= 3) {
+        if (!tagEditor.assigned(tagEditor.selectedTag).length || window.confirm("このタグの採用bboxを手描きbboxへ置き換えますか？")) {
+          tagEditor.draw([[left, top], [right, bottom]]);
+          syncTagAnnotation();
+          setAnnotationMode("confirm");
+        }
+      }
+      dragStart = null;
+      previewPoint = null;
+      drawImage(detailCanvas, selectedItem, image, true);
+    });
+    detailCanvas.addEventListener("pointercancel", () => {
+      dragStart = null;
+      previewPoint = null;
+      refreshTagReview();
+    });
+
+    document.querySelector("#save-detail").addEventListener("click", async () => {
+      try {
+        const current = items.find(item => item.revision === selectedItem.revision);
+        if (JSON.stringify(current.objects) !== JSON.stringify(selectedItem.objects)) throw new Error("DINO判定に未保存の変更がある。先に「保存して次へ」を実行してください");
+        selectedItem.annotation = tagEditor.annotation(selectedItem.annotation);
+        await request("/api/annotation", "POST", {revision: selectedItem.revision, annotation: selectedItem.annotation});
+        // 確認状態の保存失敗も詳細画面で通知し、成功として閉じない。
+        await request("/api/reviewed", "POST", {revision: selectedItem.revision, reviewed: document.querySelector("#detail-reviewed").checked});
+        detailDialog.close();
+        await loadItems();
+        showNotice("修正を保存しました。", "success");
+      } catch (error) {
+        document.querySelector("#tag-message").textContent = error.message;
+      }
+    });
+    function hasUnsavedDetail() {
+      if (!detailDialog.open || !selectedItem) return false;
+      const current = items.find(item => item.revision === selectedItem.revision);
+      return !current || JSON.stringify(current.annotation) !== JSON.stringify(selectedItem.annotation)
+        || tagEdits
+        || JSON.stringify(current.objects) !== JSON.stringify(selectedItem.objects)
+        || document.querySelector("#detail-reviewed").checked !== Boolean(current.reviewed || current.approved);
+    }
+
+    function closeDetail() {
+      if (savingReview) return;
+      if (hasUnsavedDetail()) document.querySelector("#discard-dialog").showModal();
+      else detailDialog.close();
+    }
+
+    document.querySelector("#close-detail").addEventListener("click", closeDetail);
+    detailDialog.addEventListener("cancel", event => {
+      event.preventDefault();
+      closeDetail();
+    });
+    detailDialog.addEventListener("click", event => {
+      if (event.target === detailDialog) closeDetail();
+    });
+    document.querySelector("#continue-review").addEventListener("click", () => document.querySelector("#discard-dialog").close());
+    document.querySelector("#discard-review").addEventListener("click", () => {
+      document.querySelector("#discard-dialog").close();
+      detailDialog.close();
+    });
+    window.addEventListener("beforeunload", event => {
+      if (savingReview || hasUnsavedDetail()) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    });
+
+    for (const button of document.querySelectorAll(".filter")) {
+      button.addEventListener("click", () => {
+        currentFilter = button.dataset.filter;
+        for (const candidate of document.querySelectorAll(".filter")) candidate.setAttribute("aria-pressed", String(candidate === button));
+        renderGallery();
+      });
+    }
+
+    document.querySelector("#confirm-high").addEventListener("click", async () => {
+      const highItems = items.filter(item => item.session_id === selectedSession && item.confidence === "high" && !item.approved);
+      try {
+        await Promise.all(highItems.map(item => request("/api/reviewed", "POST", {revision: item.revision, reviewed: true})));
+        for (const item of highItems) item.reviewed = true;
+        renderGallery();
+        showNotice(`高信頼度 ${highItems.length} 件を確認済みにしました。`, "success");
+      } catch (error) {
+        showNotice(error.message, "error");
+      }
+    });
+
+    document.querySelector("#publish-button").addEventListener("click", async () => {
+      const reviewer = document.querySelector("#reviewer").value.trim();
+      const confirmComplete = document.querySelector("#confirm-complete").checked;
+      try {
+        if (!reviewer) throw new Error("一括公開欄の確認担当者を入力してください");
+        if (!confirmComplete) throw new Error("「選択セッションの全画像を確認済み」にチェックを入れてください");
+        const unchecked = items.filter(item => item.session_id === selectedSession && !item.reviewed && !item.approved).length;
+        if (unchecked) throw new Error(`選択セッションに未確認画像が${unchecked}件ある。各画像の「一覧確認済」をチェックしてください`);
+        const result = await request("/api/publish", "POST", {reviewer, session_id: selectedSession, confirm_complete: confirmComplete});
+        showNotice(`公開しました: ${result.manifest}`, "success");
+        await loadItems();
+      } catch (error) {
+        showNotice(error.message, "error");
+      }
+    });
+
+    document.querySelector("#session-select").addEventListener("change", event => {
+      selectedSession = event.currentTarget.value;
+      document.querySelector("#confirm-complete").checked = false;
+      renderGallery();
+    });
+
+    document.querySelector("#date-select").addEventListener("change", event => {
+      selectedDate = event.currentTarget.value;
+      renderSessionPicker();
+      document.querySelector("#confirm-complete").checked = false;
+      renderGallery();
+    });
+
+    function renderSessionPicker() {
+      const available = sessions.filter(session => items.some(item => item.session_id === session && item.capture_date === selectedDate));
+      if (!available.includes(selectedSession)) selectedSession = available[0] || "";
+      const select = document.querySelector("#session-select");
+      select.innerHTML = available.map(session => `<option value="${escapeHtml(session)}">${escapeHtml(session)}</option>`).join("");
+      select.value = selectedSession;
+      select.disabled = available.length === 0;
+    }
+
+    async function loadItems() {
+      try {
+        const result = await request("/api/items");
+        items = result.items;
+        sessions = result.sessions;
+        const dates = [...new Set(items.map(item => item.capture_date))].sort().reverse();
+        if (!dates.includes(selectedDate)) selectedDate = dates[0] || "";
+        const dateSelect = document.querySelector("#date-select");
+        dateSelect.innerHTML = dates.map(date => `<option value="${escapeHtml(date)}">${escapeHtml(date)}</option>`).join("");
+        dateSelect.value = selectedDate;
+        dateSelect.disabled = dates.length === 0;
+        renderSessionPicker();
+        renderGallery();
+        showNotice(items.length ? `${selectedSession} の実画像上の矩形とタグ点を確認してください。` : "現在レビューできる草案はありません。");
+        return true;
+      } catch (error) {
+        showNotice(error.message, "error");
+        return false;
+      }
+    }
+
+    loadItems();
+  </script>
+</body>
+</html>
