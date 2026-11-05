@@ -30,6 +30,7 @@ from sam3_pipeline.infrastructure.annotation_store import (
     FileAnnotationStore,
     atomic_json,
     content_hash,
+    digest_file,
     read_json,
     validate_rectangles,
 )
@@ -43,6 +44,8 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MASK_ROUTE_PARTS = 2
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+# セッションIDに使えない「+」で追加公開先を区切り、別セッションの公開先と衝突させない。
+ADDITIONAL_EXPORT_SEPARATOR = "+"
 
 
 class BatchReviewServer:
@@ -178,6 +181,7 @@ class BatchReviewServer:
     def _items(self) -> list[dict[str, Any]]:
         """起動時SQL集合に存在する最新リビジョンだけを一覧化する。"""
         progress = self._read_progress()
+        published, published_images = self._published_index()
         items = []
         for metadata_path in sorted((self.store.root / DRAFTS_DIR).glob("*/metadata.json")):
             revision = metadata_path.parent.name
@@ -191,10 +195,13 @@ class BatchReviewServer:
                 continue
             review_dir = self.store.root / REVIEWS_DIR / revision
             annotation = read_json(review_dir / ANNOTATION_FILE)
+            published_key = (source["session_id"], source["image_id"], revision, digest_file(review_dir / ANNOTATION_FILE))
             metadata = read_json(metadata_path)
             confidence = assess_review_confidence(metadata, annotation, self.thresholds)
             state = self._progress_state(progress.get(revision))
-            approved = (self.store.root / APPROVALS_DIR / f"{revision}.json").is_file()
+            approval_path = self.store.root / APPROVALS_DIR / f"{revision}.json"
+            # 編集後に残った旧承認だけでYOLO確認済みに戻さないよう、注釈hashの一致も要求する。
+            approved = approval_path.is_file() and read_json(approval_path).get("labelme_sha256") == published_key[3]
             objects: list[dict[str, Any]] = []
             dino_approved = approved
             if self.store.review_store is not None:
@@ -223,6 +230,8 @@ class BatchReviewServer:
                     "allow_empty": state["allow_empty"],
                     "approved": approved,
                     "dino_approved": dino_approved,
+                    "published": published_key in published,
+                    "published_other_version": published_key not in published and published_key[:2] in published_images,
                     "objects": objects,
                 }
             )
@@ -383,30 +392,51 @@ class BatchReviewServer:
             atomic_json(self.store.root / PROGRESS_FILE, progress)
         self.store.record_review_state(revision, False)
 
+    def _published_index(self) -> tuple[set[tuple[str, str, str, str]], set[tuple[str, str]]]:
+        """既存manifestから公開済みの画像・版・注釈hashと画像識別を集める。"""
+        published: set[tuple[str, str, str, str]] = set()
+        images: set[tuple[str, str]] = set()
+        for manifest_path in sorted((self.store.root / "exports").glob("*/manifest.json")):
+            for record in read_json(manifest_path).get("samples", []):
+                source = record.get("source", {})
+                image = (str(source.get("session_id")), str(source.get("image_id")))
+                published.add((*image, str(record.get("revision")), str(record.get("labelme_sha256"))))
+                images.add(image)
+        return published, images
+
+    def _publish_destination(self, session_id: str) -> Path:
+        """既存公開先を変更せず、初回はセッション名、追加分は連番の別フォルダーへ公開する。"""
+        exports = self.store.root / "exports"
+        destination = exports / session_id
+        number = 2
+        while destination.exists():
+            destination = exports / f"{session_id}{ADDITIONAL_EXPORT_SEPARATOR}{number:03d}"
+            number += 1
+        return destination
+
     def _publish(self, payload: dict[str, Any]) -> Path:
-        """選択セッションの確認済み草案を承認し、セッション名で公開する。"""
+        """選択セッションのYOLO確認済みで未公開の画像だけを承認し、重複しない差分バッチとして公開する。"""
         raw_reviewer = payload.get("reviewer")
         if not isinstance(raw_reviewer, str) or not raw_reviewer.strip():
             raise CaptureError("一括公開欄の確認担当者を入力してください")
         reviewer = raw_reviewer.strip()
         if payload.get("confirm_complete") is not True:
-            raise CaptureError("「選択セッションの全画像を確認済み」にチェックを入れてください")
+            raise CaptureError("「YOLO確認済み画像だけを公開する」にチェックを入れてください")
         session_id = str(payload.get("session_id", "")).strip()
         if not SESSION_ID_PATTERN.fullmatch(session_id):
             raise ValueError("有効なセッションを選択してください")
         items = [item for item in self._items() if item["session_id"] == session_id]
         if not items:
             raise CaptureError("選択セッションに現行レビュー画像がありません")
-        destination = self.store.root / "exports" / session_id
-        if destination.exists():
-            raise CaptureError(f"Export destination already exists: {destination}")
+        unchecked = sum(not item["reviewed"] for item in items)
+        held = sum(item["reviewed"] and item["published_other_version"] for item in items)
+        targets = [item for item in items if item["reviewed"] and not item["published"] and not item["published_other_version"]]
+        if not targets:
+            detail = f"（未確認{unchecked}件" + (f"、公開済み画像の変更版{held}件は保留" if held else "") + "）"
+            raise CaptureError(f"公開対象が0件のため公開できません{detail}。各画像の「YOLO確認済み」をチェックしてください")
         progress = self._read_progress()
-        unchecked = sum(not self._progress_state(progress.get(item["revision"]))["reviewed"] and not item["approved"] for item in items)
-        if unchecked:
-            raise CaptureError(f"選択セッションに未確認画像が{unchecked}件ある。各画像の「一覧確認済」をチェックしてください")
-        notes = {revision: self._progress_state(progress.get(revision))["exception_note"] for revision in progress}
         approved_items: list[tuple[str, str, bool]] = []
-        for item in items:
+        for item in targets:
             revision = item["revision"]
             metadata = read_json(self.store.root / DRAFTS_DIR / revision / "metadata.json")
             annotation = read_json(self.store.root / REVIEWS_DIR / revision / ANNOTATION_FILE)
@@ -417,14 +447,14 @@ class BatchReviewServer:
             shapes = validate_rectangles(annotation, allowed, source["width"], source["height"], allow_empty=state["allow_empty"])
             expected = Counter(tag["instrument_uid"] for tag in source["tags"] if tag["visible"])
             actual = Counter(shape["label"] for shape in shapes)
-            note = notes.get(revision, "")
+            note = state["exception_note"]
             if expected != actual and not note.strip():
                 raise CaptureError(f"{revision}: tag and rectangle counts differ; enter an exception note")
             approved_items.append((revision, note, state["allow_empty"]))
 
         for revision, note, empty_ok in approved_items:
             self.store.approve(revision, reviewer, confirm_complete=True, allow_empty=empty_ok, exception_note=note)
-        return self.store.export_approved(destination, session_id=session_id)
+        return self.store.export_approved(self._publish_destination(session_id), session_id=session_id, revisions={revision for revision, _, _ in approved_items})
 
     def _read_progress(self) -> dict[str, Any]:
         """Read reviewer checkboxes without altering immutable annotation records."""

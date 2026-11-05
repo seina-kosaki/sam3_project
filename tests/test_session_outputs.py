@@ -1104,3 +1104,27 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
         with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
             assert connection.execute("SELECT prompt, min_score, is_dino_ready FROM sam3_dino_results WHERE model_signature=?", (signature,)).fetchall() == [("instrument", 0.45, 0)]
     assert not (workflow.root / "metadata.sqlite3").exists()
+
+
+def test_review_server_partial_publish_keeps_yolo_independent_of_dino_and_edit_clears(workflow: Workflow) -> None:
+    """DINO全不採用保存はYOLO確認・公開を変えず、YOLO編集は確認と承認表示を解除する。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+    server._set_reviewed({"revision": revision, "reviewed": True})
+    manifest = server._publish({"reviewer": "operator", "session_id": sample.session_id, "confirm_complete": True})
+    before = manifest.read_bytes()
+
+    server._complete_review({"revision": revision, "reviewer": "operator", "confirm_complete": True,
+                             "decisions": [{"object_index": 0, "status": "rejected"}],
+                             "assignments": [{"object_index": 0, "instrument_uid": None, "instance_no": None}]})
+
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert item["reviewed"] and item["approved"] and item["published"]
+    assert _flags(workflow, sample)[1] == 1
+    assert manifest.read_bytes() == before
+    annotation = json.loads((workflow.store.root / "reviews" / revision / "annotation.json").read_text(encoding="utf-8"))
+    annotation["shapes"][0]["points"][1][0] -= 1
+    server._save_annotation({"revision": revision, "annotation": annotation})
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert not item["reviewed"] and not item["approved"] and not item["published"]

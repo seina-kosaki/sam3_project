@@ -73,7 +73,7 @@ const document = {
   querySelectorAll: () => []
 };
 const sandbox = vm.createContext({
-  document, structuredClone, window: {addEventListener() {}},
+  document, structuredClone, performance, console, window: {addEventListener() {}},
   fetch: async () => ({ok: true, headers: {get: () => "application/json"},
     json: async () => ({items: [], sessions: []})})
 });
@@ -230,3 +230,193 @@ def test_dino_save_uses_unsaved_decisions_and_latest_index(
     else:
         assert actual["current"] == item
         assert "保存を中止" in actual["message"]
+
+
+NODE_HARNESS = """
+const vm = require("node:vm");
+const input = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+const elements = new Map(), log = {posts: [], closes: 0, opened: [], strokes: []};
+function makeElement() {
+  const callbacks = {};
+  const element = {
+    innerHTML: "", textContent: "", value: "operator", disabled: false, hidden: false, checked: false, style: {},
+    querySelectorAll: () => [], setAttribute() {}, focus() {},
+    addEventListener(event, callback) { callbacks[event] = callback; },
+    showModal() { element.open = true; }, close() { element.open = false; log.closes++; }, callbacks
+  };
+  element.getContext = () => {
+    const ctx = {clearRect() {}, drawImage() {}, setLineDash() {}, strokeText() {}, fillText() {}, beginPath() {}, arc() {}, fill() {}, stroke() {},
+      strokeRect(...args) { log.strokes.push({style: ctx.strokeStyle, width: ctx.lineWidth, rect: args}); }};
+    return ctx;
+  };
+  return element;
+}
+const document = {
+  querySelector(selector) {
+    if (!elements.has(selector)) elements.set(selector, makeElement());
+    return elements.get(selector);
+  },
+  querySelectorAll: () => []
+};
+const sandbox = vm.createContext({
+  document, structuredClone, performance, console, log, input, setImmediate,
+  Image: class { constructor() { this.complete = false; } },
+  window: {addEventListener() {}, confirm: () => true},
+  fetch: async () => ({ok: true, headers: {get: () => "application/json"}, json: async () => ({items: [], sessions: []})})
+});
+(async () => {
+  vm.runInContext(input.script, sandbox);
+  await new Promise(resolve => setImmediate(resolve));
+  const result = await vm.runInContext("(async () => {" + input.body + "})()", sandbox);
+  process.stdout.write(JSON.stringify({result, log, message: document.querySelector("#object-message").textContent,
+    counts: document.querySelector("#publish-counts").textContent, publishDisabled: document.querySelector("#publish-button").disabled}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+
+
+def _run_ui(body: str, item: dict[str, object]) -> dict[str, object]:
+    """配信スクリプトを読み込んだ隔離環境で任意の操作を実行する。"""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("レビューUIのJavaScript検証にはNode.jsが必要である")
+    script = TAG_REVIEW_JS.read_text(encoding="utf-8") + "\n" + REVIEW_HTML.read_text(encoding="utf-8").split("<script>", 1)[1].split("</script>", 1)[0]
+    result = subprocess.run(
+        [node, "-e", NODE_HARNESS],
+        input=json.dumps({"script": script, "body": f"const testItem = {json.dumps(item)};\n{body}"}),
+        text=True, encoding="utf-8", capture_output=True, check=True, timeout=10,
+    )
+    return json.loads(result.stdout)
+
+
+DINO_ITEM = {
+    "revision": "r1", "session_id": "session", "capture_date": "2026-10-30", "image_id": "image", "image_url": "/api/image/r1",
+    "confidence": "high", "reviewed": True, "approved": True, "width": 8, "height": 8, "tags": [], "annotation": {"shapes": []},
+    "objects": [
+        {"object_index": 0, "dino_status": "accepted", "instrument_uid": "tool", "instance_no": 1, "bbox": [0, 0, 2, 2]},
+        {"object_index": 1, "dino_status": "pending", "instrument_uid": None, "instance_no": None, "bbox": [0, 0, 2, 2]},
+    ],
+}
+DINO_SETUP = """
+const next = {...structuredClone(testItem), revision: "r2"};
+items = [structuredClone(testItem), structuredClone(next)];
+selectedItem = structuredClone(testItem);
+viewedObjects = new Set();
+loadItems = async () => true;
+openDetail = item => log.opened.push(item.revision);
+const latest = {items: [structuredClone(testItem), next]};
+"""
+
+
+def test_dino_reject_all_saves_without_viewing_and_moves_next() -> None:
+    """未閲覧・既存採用を含んでも一操作で全不採用を保存し、成功後だけ次へ進む。"""
+    actual = _run_ui(DINO_SETUP + """
+request = async (url, method, payload) => { if (method === "POST") { log.posts.push(payload); return {}; } return latest; };
+await document.querySelector("#reject-all-object-review").callbacks.click();
+return {reviewed: items[0].reviewed, approved: items[0].approved, dino: items[0].dino_approved, timings: window.reviewSaveTimings.length};
+""", DINO_ITEM)
+
+    assert len(actual["log"]["posts"]) == 1
+    post = actual["log"]["posts"][0]
+    assert post["decisions"] == [{"object_index": 0, "status": "rejected"}, {"object_index": 1, "status": "rejected"}]
+    assert all(entry["instrument_uid"] is None and entry["instance_no"] is None for entry in post["assignments"])
+    assert post["overwrite_masks"] is False
+    assert actual["log"]["opened"] == ["r2"]
+    # DINO保存でYOLO確認・承認を変えない。
+    assert actual["result"] == {"reviewed": True, "approved": True, "dino": False, "timings": 0}
+
+
+def test_dino_normal_save_still_requires_individual_review() -> None:
+    """通常の保存して次へは未判定・未閲覧を従来どおり拒否する。"""
+    actual = _run_ui(DINO_SETUP + """
+request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return latest; };
+await document.querySelector("#save-object-review").callbacks.click();
+""", DINO_ITEM)
+
+    assert actual["log"]["posts"] == []
+    assert "未判定" in actual["message"]
+    assert actual["log"]["opened"] == []
+
+
+def test_dino_save_failure_stays_and_double_click_posts_once() -> None:
+    """保存中の再クリックを送信せず、保存失敗時は現在画像に留まりエラーを示す。"""
+    actual = _run_ui(DINO_SETUP + """
+let release;
+request = async (url, method, payload) => {
+  if (method !== "POST") return latest;
+  log.posts.push(payload);
+  await new Promise(resolve => { release = resolve; });
+  throw new Error("simulated save failure");
+};
+const first = document.querySelector("#reject-all-object-review").callbacks.click();
+while (!release) await new Promise(resolve => setImmediate(resolve));
+const busy = savingReview;
+const busyMessage = document.querySelector("#object-message").textContent;
+await document.querySelector("#reject-all-object-review").callbacks.click();
+release();
+await first;
+return {busy, busyMessage, saving: savingReview, objects: items[0].objects};
+""", DINO_ITEM)
+
+    assert len(actual["log"]["posts"]) == 1
+    assert actual["result"]["busy"] is True and "保存中" in actual["result"]["busyMessage"]
+    assert actual["result"]["saving"] is False
+    assert actual["message"] == "simulated save failure"
+    assert actual["log"]["opened"] == [] and actual["log"]["closes"] == 0
+    assert actual["result"]["objects"] == DINO_ITEM["objects"]
+
+
+def test_yolo_draw_mode_hides_existing_and_outlines_new_box() -> None:
+    """描画モードは既存bboxを描かず、今回の描画bboxを黄色＋濃色縁取りで示す。"""
+    item = {**DINO_ITEM, "tags": [{"instrument_uid": "tool", "instance_no": 1, "visible": True}],
+            "annotation": {"shapes": [{"label": "tool", "points": [[1, 1], [5, 5]], "shape_type": "rectangle", "group_id": None, "flags": {}}]}}
+    actual = _run_ui("""
+selectedItem = structuredClone(testItem);
+tagEditor = new TagReview.Editor(selectedItem);
+const fake = {naturalWidth: 8, naturalHeight: 8};
+tagEditor.mode = "draw";
+drawImage(detailCanvas, selectedItem, fake, true);
+const hidden = log.strokes.length;
+dragStart = {x: 2, y: 2}; previewPoint = {x: 6, y: 6};
+drawImage(detailCanvas, selectedItem, fake, true);
+const preview = log.strokes.slice(hidden);
+log.strokes.length = 0;
+dragStart = null; previewPoint = null;
+tagEditor.selectedTag = 0;
+tagEditor.draw([[2, 2], [6, 6]]);
+drawnShapes.add(tagEditor.entries[tagEditor.entries.length - 1].shape);
+tagEditor.mode = "draw";
+drawImage(detailCanvas, selectedItem, fake, true);
+const drawn = log.strokes.slice();
+log.strokes.length = 0;
+tagEditor.mode = "confirm";
+drawImage(detailCanvas, selectedItem, fake, true);
+return {hidden, preview, drawn, confirmCount: log.strokes.length, entries: tagEditor.entries.length};
+""", item)
+    result = actual["result"]
+
+    assert result["hidden"] == 0
+    assert [stroke["style"] for stroke in result["preview"]] == ["#111111", "#ffd400"]
+    assert result["preview"][0]["width"] > result["preview"][1]["width"]
+    assert [stroke["style"] for stroke in result["drawn"]] == ["#111111", "#ffd400"]
+    # 表示切替だけでは既存bboxを失わず、確認モードで再表示される。
+    assert result["entries"] == result["confirmCount"] == len(item["annotation"]["shapes"]) + 1
+
+
+@pytest.mark.parametrize(
+    "states,expected,disabled",
+    [
+        ([(True, False, False), (False, False, False)], "公開対象 1件／未確認 1件", False),
+        ([(True, True, False), (False, False, False)], "公開対象 0件／未確認 1件（公開済み 1件）", True),
+        ([(True, False, True), (True, False, False)], "公開対象 1件／未確認 0件（公開済み画像の変更版 1件は保留）", False),
+    ],
+)
+def test_publish_counts_show_targets_and_unchecked(states: list[tuple[bool, bool, bool]], expected: str, *, disabled: bool) -> None:
+    """公開前に対象・未確認件数を示し、対象0件では公開ボタンを無効にする。"""
+    body = "items = " + json.dumps([
+        {**DINO_ITEM, "revision": f"r{index}", "reviewed": reviewed, "approved": False, "published": published, "published_other_version": other}
+        for index, (reviewed, published, other) in enumerate(states)
+    ]) + "; selectedSession = 'session'; renderSummary();"
+    actual = _run_ui(body, DINO_ITEM)
+
+    assert actual["counts"] == expected
+    assert actual["publishDisabled"] is disabled

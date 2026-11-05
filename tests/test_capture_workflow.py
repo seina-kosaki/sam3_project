@@ -889,7 +889,7 @@ def test_batch_review_publish_includes_only_selected_session(tmp_path: Path) -> 
         ("  ", True, "一括公開欄の確認担当者"),
         (None, True, "一括公開欄の確認担当者"),
         ("operator", False, "チェックを入れて"),
-        ("operator", True, "未確認画像が1件"),
+        ("operator", True, "公開対象が0件"),
     ],
 )
 def test_review_server_publish_missing_requirement_reports_specific_reason(tmp_path: Path, reviewer: str | None, confirmed: bool, message: str) -> None:
@@ -1177,3 +1177,71 @@ def test_approve_nonrectangle_shape_rejects_conversion(tmp_path: Path, shape_typ
 
     with pytest.raises(CaptureError, match="rectangles"):
         store.approve(revision, "reviewer", confirm_complete=True)
+
+
+def _same_session_pair(tmp_path: Path) -> tuple[FileAnnotationStore, str, str, BatchReviewServer]:
+    """同一セッションに2画像を作り、部分公開の検証に使う。"""
+    store, revision, sample = _draft(tmp_path)
+    second_path = "2026-10-23/session_a/raw/second.png"
+    second_image = tmp_path / Path(second_path)
+    Image.new("RGB", (100, 100), "blue").save(second_image)
+    second_sample = replace(sample, image_id="image_b", image_path=second_image, sha256=digest_file(second_image), source_path=second_path)
+    with sqlite3.connect(tmp_path / "2026-10-23" / "session_a" / "metadata.sqlite3") as connection:
+        connection.execute(
+            "INSERT INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("session_a", "image_b", sample.declaration_id, sample.arrangement_no, second_path, second_sample.sha256, sample.width, sample.height, sample.tag_revision, "tagged", None),
+        )
+    store.capture_source.add(second_sample)
+    second_revision = annotate(MemorySource(second_sample), FakePredictor(), ScipyInstanceMatcher(MatchSettings(0.03, 0.05)), store)[0]
+    server = BatchReviewServer(store, ConfidenceThresholds(0.65, 0.85), (sample, second_sample))
+    return store, revision, second_revision, server
+
+
+def test_publish_partial_then_additional_without_duplicates(tmp_path: Path) -> None:
+    """YOLO確認済みだけを公開し、後日の追加公開は既存公開物を変えず重複しない。"""
+    store, first, second, server = _same_session_pair(tmp_path)
+    payload = {"reviewer": "reviewer_a", "session_id": "session_a", "confirm_complete": True}
+    server._set_reviewed({"revision": first, "reviewed": True})
+
+    manifest = server._publish(payload)
+
+    assert manifest.parent.name == "session_a"
+    assert [record["revision"] for record in read_json(manifest)["samples"]] == [first]
+    assert not (store.root / "approvals" / f"{second}.json").exists()
+    first_bytes = manifest.read_bytes()
+    items = {item["revision"]: item for item in server._items()}
+    assert items[first]["published"] and not items[second]["published"]
+    with pytest.raises(CaptureError, match="公開対象が0件"):
+        server._publish(payload)
+
+    server._set_reviewed({"revision": second, "reviewed": True})
+    added = server._publish(payload)
+
+    assert added.parent.name == "session_a+002"
+    assert [record["revision"] for record in read_json(added)["samples"]] == [second]
+    assert manifest.read_bytes() == first_bytes
+    with pytest.raises(CaptureError, match="公開対象が0件"):
+        server._publish(payload)
+    assert sorted(path.name for path in (store.root / "exports").iterdir()) == ["session_a", "session_a+002"]
+
+
+def test_publish_edit_clears_yolo_review_and_holds_changed_published_version(tmp_path: Path) -> None:
+    """注釈編集で確認を解除し、公開済み画像の変更版は再確認後も重複公開しない。"""
+    store, first, _, server = _same_session_pair(tmp_path)
+    payload = {"reviewer": "reviewer_a", "session_id": "session_a", "confirm_complete": True}
+    server._set_reviewed({"revision": first, "reviewed": True})
+    manifest = server._publish(payload)
+    before = manifest.read_bytes()
+    annotation = read_json(store.root / "reviews" / first / "annotation.json")
+    annotation["shapes"][0]["points"][1][0] -= 1
+
+    server._save_annotation({"revision": first, "annotation": annotation})
+
+    item = next(item for item in server._items() if item["revision"] == first)
+    assert not item["reviewed"] and not item["approved"]
+    assert item["published_other_version"] and not item["published"]
+    server._set_reviewed({"revision": first, "reviewed": True})
+    with pytest.raises(CaptureError, match="変更版1件は保留"):
+        server._publish(payload)
+    assert manifest.read_bytes() == before
+    assert [path.name for path in (store.root / "exports").iterdir()] == ["session_a"]

@@ -432,12 +432,13 @@ class FileAnnotationStore:
             atomic_json(self.root / APPROVALS_DIR / f"{revision}.json", record)
         return approval_id
 
-    def export_approved(self, destination: Path, session_id: str | None = None) -> Path:
+    def export_approved(self, destination: Path, session_id: str | None = None, revisions: set[str] | None = None) -> Path:
         """SQL上で現行の承認を、画像を複製せずにmanifestへ公開する。
 
         Args:
             destination: 新規公開先。既存の出力は上書きしない。
             session_id: 指定時に公開対象をそのセッションの承認だけに限定する。
+            revisions: 指定時に公開対象をこのレビュー版の承認だけに限定する（部分・追加公開用）。
 
         Returns:
             yolo_trainが読み込むmanifest.jsonのパス。
@@ -446,7 +447,7 @@ class FileAnnotationStore:
             CaptureError: 現行承認がない、レビュー内容が変化した、または識別子が重複した場合。
         """
         stored_records = [read_json(path) for path in sorted((self.root / APPROVALS_DIR).glob("*.json"))]
-        records = [record for record in stored_records if (session_id is None or record["source"]["session_id"] == session_id) and self._source_is_current(record["source"])]
+        records = [record for record in stored_records if (session_id is None or record["source"]["session_id"] == session_id) and (revisions is None or record["revision"] in revisions) and self._source_is_current(record["source"])]
         if not records:
             raise CaptureError("No currently approved SQL capture images are available")
         samples: list[dict[str, Any]] = []
