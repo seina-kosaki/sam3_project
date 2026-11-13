@@ -32,6 +32,7 @@ from sam3_pipeline.infrastructure.matching import MatchSettings, ScipyInstanceMa
 from sam3_pipeline.infrastructure.object_review_store import SqliteObjectReviewStore
 from sam3_pipeline.infrastructure.prediction_store import SqlitePredictionStore
 from sam3_pipeline.infrastructure.review_server import BatchReviewServer
+from sam3_pipeline.infrastructure.selection_server import REVIEW_RETURN_QUERY, SelectiveInferenceServer
 from sam3_pipeline.usecase.capture import annotate_samples
 
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     source = SqliteCaptureSource(root, timeout=config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT))
     store = FileAnnotationStore(output, source, SqliteAnnotationLedger(root, config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT)))
     prediction_store: SqlitePredictionStore | None = None
+    reviews: SqliteObjectReviewStore | None = None
     if arguments.command in {"run", "annotate", "migrate-predictions", "review", "approve", "revoke", "export"}:
         mask_root = _path(config, "mask_root", base) if config.get("mask_root") else root / DEFAULT_MASK_DIRECTORY
         model_metadata = {name: config.get(name) for name in ("checkpoint", "bpe_path", "prompt", "min_score")}
@@ -109,17 +111,50 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.command == "migrate-predictions":
             store.migrate_predictions(prediction_store)
         store.review_store = reviews
-        store.sync_object_reviews()
+        if arguments.command not in {"run", "annotate"}:
+            store.sync_object_reviews()
     if arguments.command in {"run", "annotate"}:
         if arguments.limit is not None and arguments.limit <= 0:
             raise CaptureError("Limit must be positive")
-        predictor = preview_predictor()
+        try:
+            predictor = preview_predictor()
+            predictor.initialize()
+        except Exception as error:
+            LOGGER.exception("SAM3モデルの初期化に失敗しました")
+            raise CaptureError("SAM3モデル初期化に失敗したため、推論を開始できません") from error
         matcher = ScipyInstanceMatcher(MatchSettings(**config["matching"]))
-        samples = tuple(source.iter_samples())
-        revisions = annotate_samples(samples, predictor, matcher, store, arguments.limit, prediction_store=prediction_store)
-        LOGGER.info("Review revisions: %s", json.dumps(revisions))
+        assert prediction_store is not None
+        assert reviews is not None
+        selection = SelectiveInferenceServer(source, store, reviews)
         thresholds = ConfidenceThresholds(**config["review_confidence"])
-        BatchReviewServer(store, thresholds, samples).serve()
+        try:
+            while True:
+                selected = selection.select()
+                if arguments.limit is not None:
+                    if len(selected) > arguments.limit:
+                        LOGGER.warning("選択した %s 件のうち --limit により先頭 %s 件だけを処理します", len(selected), arguments.limit)
+                    selected = selected[: arguments.limit]
+                store.sync_object_reviews(set(selected))
+                selected_samples = []
+                for session_id, image_id in selected:
+                    item = selection.entry_by_identity[(session_id, image_id)]
+                    sample = source.current_sample(session_id, image_id, item["source_path"])
+                    if sample is not None:
+                        selected_samples.append(sample)
+                samples = tuple(selected_samples)
+                if len(samples) != len(selected):
+                    raise CaptureError("選択した画像の一部は撮影SQL上で削除または変更されています。推論を中止しました")
+                revisions = annotate_samples(samples, predictor, matcher, store, arguments.limit, prediction_store=prediction_store)
+                LOGGER.info("Review revisions: %s", json.dumps(revisions))
+                selection.begin_review()
+                assert selection.url is not None
+                review = BatchReviewServer(store, thresholds, samples)
+                return_url = f"{selection.url}?{REVIEW_RETURN_QUERY}"
+                review.serve(selection_return_url=return_url, stop_event=selection.review_complete)
+                if not selection.review_complete.is_set():
+                    break
+        finally:
+            selection.close()
     elif arguments.command == "migrate-predictions":
         assert prediction_store is not None
         LOGGER.info("推論結果の移行処理件数: %s", store.migrate_predictions(prediction_store))

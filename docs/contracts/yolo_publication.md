@@ -8,6 +8,7 @@
 |---|---|---|
 | UI → レビューサーバー | `POST /api/reviewed`: `revision: string`、`reviewed: boolean`。既存の`allow_empty`、`exception_note`も使用 | 現行YOLO注釈の確認状態。DINO採否・承認とは独立 |
 | UI → レビューサーバー | `POST /api/publish`: 現行は`session_id: string`、`reviewer: string`、`confirm_complete: true` | 現行はセッション全画像確認後、`exports/<session_id>/manifest.json`を新規公開。変更後はYOLO確認済みの今回対象だけを公開し、未確認を除外。全画像確認を意味する現行`confirm_complete`の扱いは実装前に整理する |
+| レビューデータ → UI | `GET /api/items`の`annotation` | 新規草案は`tag_review_version: 1`を使用し、一意に対応したshapeだけを`shapes`へ、未解決shapeはラベルを付けず`review_candidates`へ分ける。旧形式も読み込み可能で、初期生成時と完全一致する未確認・未承認の草案だけを自動移行する |
 | SAM3公開処理 → YOLO取得側 | 現行承認・注釈・撮影原本参照 | schema version 1のmanifestとLabelme注釈、および所属セッションDBの`sam3_yolo_results`。画像原本は複製しない |
 
 公開前のUI表示は「公開対象○件／未確認○件」。今回対象に同一データの公開済み分を再登録しない。対象0件では公開しない。bbox等のYOLO編集後は確認を解除し、再確認・必要な再承認を経る。

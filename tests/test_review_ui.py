@@ -86,6 +86,7 @@ const sandbox = vm.createContext({
   vm.runInContext(`
     items = [structuredClone(testItem)];
     selectedItem = structuredClone(testItem);
+    selectedSession = testItem.session_id;
     viewedObjects = new Set(testItem.objects.map(object => object.object_index));
     loadItems = async () => false;
     request = async (url, method, payload) => {
@@ -93,9 +94,11 @@ const sandbox = vm.createContext({
       return {items: [latest]};
     };
   `, sandbox);
+  vm.runInContext("renderGallery()", sandbox);
   await elements.get("#save-object-review").callbacks.click();
   process.stdout.write(JSON.stringify({
     confirmations, posts, message: document.querySelector("#object-message").textContent,
+    gallery: document.querySelector("#gallery").innerHTML,
     current: vm.runInContext("items[0]", sandbox),
     selected: vm.runInContext("selectedItem", sandbox)
   }));
@@ -112,6 +115,7 @@ const sandbox = vm.createContext({
         (False, ["pending"], "未判定", False),
         (True, ["pending"], "未判定", False),
         (True, ["accepted", "pending"], "判定途中", False),
+        (False, ["accepted", "pending"], "✓ 承認済", True),
         (False, ["accepted"], "未承認", False),
         (True, ["accepted"], "✓ 承認済", True),
         (True, ["accepted", "rejected"], "✓ 承認済", True),
@@ -154,8 +158,9 @@ def test_review_gallery_separates_confidence_and_approval(
         "confidence": confidence,
         "reasons": [],
         "approved": approved,
+        "dino_approved": dino_approved,
         "reviewed": True,
-        "objects": [{"dino_status": status} for status in statuses],
+        "objects": [{"dino_status": status, "saved_mask_exists": True} for status in statuses],
     }
 
     result = subprocess.run(
@@ -200,7 +205,12 @@ def test_dino_save_uses_unsaved_decisions_and_latest_index(
         pytest.skip("レビューUIのJavaScript検証にはNode.jsが必要である")
     script = TAG_REVIEW_JS.read_text(encoding="utf-8") + "\n" + REVIEW_HTML.read_text(encoding="utf-8").split("<script>", 1)[1].split("</script>", 1)[0]
     item = {
-        "revision": "revision", "session_id": "session", "annotation": {"shapes": []},
+        "revision": "revision", "session_id": "session", "image_id": "image",
+        "capture_date": "2026-10-30", "width": 8, "height": 8,
+        "tags": [], "annotation": {"shapes": []}, "confidence": "high",
+        "reasons": [], "candidate_confidence": [], "approved": False,
+        "dino_approved": False, "reviewed": False, "published": False,
+        "published_other_version": False,
         "objects": [
             {"object_index": index, "dino_status": "accepted" if index == 1 else "rejected", "instrument_uid": "tool", "instance_no": 1}
             for index in range(3)
@@ -227,6 +237,7 @@ def test_dino_save_uses_unsaved_decisions_and_latest_index(
     if saved:
         assert actual["posts"][0]["overwrite_masks"] == confirmed
         assert actual["posts"][0]["decisions"] == [{"object_index": obj["object_index"], "status": obj["dino_status"]} for obj in item["objects"]]
+        assert "✓ 承認済" in actual["gallery"]
     else:
         assert actual["current"] == item
         assert "保存を中止" in actual["message"]
@@ -268,7 +279,8 @@ const sandbox = vm.createContext({
   vm.runInContext(input.script, sandbox);
   await new Promise(resolve => setImmediate(resolve));
   const result = await vm.runInContext("(async () => {" + input.body + "})()", sandbox);
-  process.stdout.write(JSON.stringify({result, log, message: document.querySelector("#object-message").textContent,
+  process.stdout.write(JSON.stringify({result, log, message: document.querySelector("#tag-message").textContent || document.querySelector("#object-message").textContent,
+    notice: document.querySelector("#notice").textContent, noticeClass: document.querySelector("#notice").className,
     counts: document.querySelector("#publish-counts").textContent, publishDisabled: document.querySelector("#publish-button").disabled}));
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
@@ -307,34 +319,34 @@ const latest = {items: [structuredClone(testItem), next]};
 """
 
 
-def test_dino_reject_all_saves_without_viewing_and_moves_next() -> None:
-    """未閲覧・既存採用を含んでも一操作で全不採用を保存し、成功後だけ次へ進む。"""
+def test_dino_save_requires_an_accepted_mask() -> None:
+    """採用候補が0件なら保存せず、現在の画像に留まる。"""
     actual = _run_ui(DINO_SETUP + """
+selectedItem.objects = selectedItem.objects.map(object => ({...object, dino_status: "rejected"}));
+viewedObjects = new Set();
 request = async (url, method, payload) => { if (method === "POST") { log.posts.push(payload); return {}; } return latest; };
-await document.querySelector("#reject-all-object-review").callbacks.click();
-return {reviewed: items[0].reviewed, approved: items[0].approved, dino: items[0].dino_approved, timings: window.reviewSaveTimings.length};
-""", DINO_ITEM)
-
-    assert len(actual["log"]["posts"]) == 1
-    post = actual["log"]["posts"][0]
-    assert post["decisions"] == [{"object_index": 0, "status": "rejected"}, {"object_index": 1, "status": "rejected"}]
-    assert all(entry["instrument_uid"] is None and entry["instance_no"] is None for entry in post["assignments"])
-    assert post["overwrite_masks"] is False
-    assert actual["log"]["opened"] == ["r2"]
-    # DINO保存でYOLO確認・承認を変えない。
-    assert actual["result"] == {"reviewed": True, "approved": True, "dino": False, "timings": 0}
-
-
-def test_dino_normal_save_still_requires_individual_review() -> None:
-    """通常の保存して次へは未判定・未閲覧を従来どおり拒否する。"""
-    actual = _run_ui(DINO_SETUP + """
-request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return latest; };
 await document.querySelector("#save-object-review").callbacks.click();
 """, DINO_ITEM)
 
     assert actual["log"]["posts"] == []
-    assert "未判定" in actual["message"]
+    assert "採用されたmaskがない" in actual["message"]
     assert actual["log"]["opened"] == []
+
+
+def test_dino_partial_save_skips_pending_candidates_and_moves_next() -> None:
+    """採用maskを確認すれば、未確認の別候補を残したまま保存できる。"""
+    actual = _run_ui(DINO_SETUP + """
+request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return latest; };
+viewedObjects = new Set([0]);
+await document.querySelector("#save-object-review").callbacks.click();
+return {dino: items[0].dino_approved, timings: window.reviewSaveTimings.length};
+""", DINO_ITEM)
+
+    post = actual["log"]["posts"][0]
+    assert post["decisions"] == [{"object_index": 0, "status": "accepted"}]
+    assert post["assignments"] == [{"object_index": 0, "instrument_uid": "tool", "instance_no": 1}]
+    assert actual["log"]["opened"] == ["r2"]
+    assert actual["result"]["dino"] is True
 
 
 def test_dino_save_failure_stays_and_double_click_posts_once() -> None:
@@ -347,11 +359,12 @@ request = async (url, method, payload) => {
   await new Promise(resolve => { release = resolve; });
   throw new Error("simulated save failure");
 };
-const first = document.querySelector("#reject-all-object-review").callbacks.click();
+viewedObjects = new Set([0]);
+const first = document.querySelector("#save-object-review").callbacks.click();
 while (!release) await new Promise(resolve => setImmediate(resolve));
 const busy = savingReview;
 const busyMessage = document.querySelector("#object-message").textContent;
-await document.querySelector("#reject-all-object-review").callbacks.click();
+await document.querySelector("#save-object-review").callbacks.click();
 release();
 await first;
 return {busy, busyMessage, saving: savingReview, objects: items[0].objects};
@@ -363,6 +376,136 @@ return {busy, busyMessage, saving: savingReview, objects: items[0].objects};
     assert actual["message"] == "simulated save failure"
     assert actual["log"]["opened"] == [] and actual["log"]["closes"] == 0
     assert actual["result"]["objects"] == DINO_ITEM["objects"]
+
+
+def test_dino_editor_rejects_other_candidates_for_the_selected_tag() -> None:
+    """一つ採用すると、同じタグの残り候補だけ自動で不採用になる。"""
+    actual = _run_ui("""
+const tags = [
+  {instrument_uid: "tool", instance_no: 1, visible: true},
+  {instrument_uid: "tool", instance_no: 2, visible: true}
+];
+const objects = [
+  {object_index: 0, dino_status: "pending", instrument_uid: "tool", instance_no: 1},
+  {object_index: 1, dino_status: "pending", instrument_uid: "tool", instance_no: 1},
+  {object_index: 2, dino_status: "pending", instrument_uid: "tool", instance_no: 2}
+];
+const editor = new TagReview.DinoEditor({tags, objects});
+editor.adopt(objects[0]);
+return objects.map(object => [object.dino_status, object.instrument_uid, object.instance_no]);
+""", DINO_ITEM)
+
+    assert actual["result"] == [
+        ["accepted", "tool", 1],
+        ["rejected", None, None],
+        ["pending", "tool", 2],
+    ]
+
+
+def test_yolo_session_bulk_confirmation_ignores_filter_and_pagination() -> None:
+    """信頼度・表示ページによらず、選択セッションのbboxあり未確認画像を一括確認する。"""
+    actual = _run_ui("""
+items = Array.from({length: 51}, (_, index) => ({
+  ...structuredClone(testItem), revision: `skip-${index}`, session_id: "selected",
+  confidence: "high", reviewed: true, approved: false, reasons: [],
+  annotation: {shapes: [{label: "tool", points: [[0, 0], [2, 2]]}]}
+}));
+items[0] = {...items[0], revision: "high-first-page", reviewed: false};
+items[2] = {...items[2], revision: "already-reviewed", reviewed: true};
+items[3] = {...items[3], revision: "empty", reviewed: false, annotation: {shapes: []}};
+items[50] = {...items[50], revision: "high-second-page", reviewed: false};
+items.push({...structuredClone(items[0]), revision: "low-hidden-by-filter", confidence: "low", reviewed: false});
+items.push({...structuredClone(items[0]), revision: "other-session", session_id: "other"});
+selectedSession = "selected";
+currentFilter = "high";
+galleryPage = 0;
+renderGallery();
+request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return {}; };
+await document.querySelector("#confirm-session-yolo").callbacks.click();
+return items.map(item => [item.revision, item.reviewed]);
+""", DINO_ITEM)
+
+    assert [post["revision"] for post in actual["log"]["posts"]] == [
+        "high-first-page", "high-second-page", "low-hidden-by-filter",
+    ]
+    reviewed = dict(actual["result"])
+    assert reviewed["high-first-page"] is True
+    assert reviewed["high-second-page"] is True
+    assert reviewed["low-hidden-by-filter"] is True
+    assert reviewed["already-reviewed"] is True
+    assert reviewed["empty"] is False
+    assert reviewed["other-session"] is False
+    assert "3件" in actual["notice"]
+    assert actual["noticeClass"] == "success"
+
+
+def test_yolo_session_bulk_confirmation_reports_partial_failures() -> None:
+    """画像単位の失敗を隠さず、成功分だけ確認済みに更新する。"""
+    actual = _run_ui("""
+items = [
+  {...structuredClone(testItem), revision: "ok", session_id: "selected", reviewed: false, approved: false,
+   reasons: [], annotation: {shapes: [{label: "tool", points: [[0, 0], [2, 2]]}]}},
+  {...structuredClone(testItem), revision: "failed", session_id: "selected", reviewed: false, approved: false,
+   reasons: [], annotation: {shapes: [{label: "tool", points: [[0, 0], [2, 2]]}]}},
+];
+selectedSession = "selected";
+renderGallery();
+request = async (url, method, payload) => {
+  if (method === "POST" && payload.revision === "failed") throw new Error("failed request");
+  if (method === "POST") log.posts.push(payload);
+  return {};
+};
+await document.querySelector("#confirm-session-yolo").callbacks.click();
+return items.map(item => item.reviewed);
+""", DINO_ITEM)
+
+    assert actual["log"]["posts"] == [{"revision": "ok", "reviewed": True}]
+    assert actual["result"] == [True, False]
+    assert "1件成功、1件失敗" in actual["notice"]
+    assert "failed request" in actual["notice"]
+    assert actual["noticeClass"] == "error"
+
+
+def test_yolo_empty_annotation_is_not_saved() -> None:
+    """採用bboxがない空画像はYOLO注釈として保存しない。"""
+    actual = _run_ui("""
+items = [structuredClone(testItem)];
+selectedItem = structuredClone(testItem);
+tagEditor = new TagReview.Editor(selectedItem);
+request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return {}; };
+await document.querySelector("#save-detail").callbacks.click();
+""", DINO_ITEM)
+
+    assert actual["log"]["posts"] == []
+    assert "採用bboxがない" in actual["message"]
+
+
+def test_yolo_manual_correction_without_candidates_is_saved() -> None:
+    """候補がない画像でも人手でbboxを描いた場合は保存する。"""
+    actual = _run_ui("""
+items = [structuredClone(testItem)];
+selectedItem = structuredClone(testItem);
+tagEditor = new TagReview.Editor(selectedItem);
+tagEditor.draw([[1, 1], [4, 4]]);
+selectedItem.annotation = tagEditor.annotation(selectedItem.annotation);
+tagEdits = true;
+loadItems = async () => true;
+request = async (url, method, payload) => {
+  if (method === "POST") { log.urls.push(url); log.posts.push(payload); }
+  return {};
+};
+log.urls = [];
+await document.querySelector("#save-detail").callbacks.click();
+return selectedItem.annotation.shapes.length;
+""", {
+        **DINO_ITEM,
+        "tags": [{"instrument_uid": "tool", "instance_no": 1, "visible": True}],
+        "annotation": {"shapes": []},
+    })
+
+    assert actual["result"] == 1
+    assert actual["log"]["urls"] == ["/api/annotation", "/api/reviewed"]
+    assert actual["log"]["posts"][0]["annotation"]["shapes"][0]["description"] == '{"manual":true}'
 
 
 def test_yolo_draw_mode_hides_existing_and_outlines_new_box() -> None:

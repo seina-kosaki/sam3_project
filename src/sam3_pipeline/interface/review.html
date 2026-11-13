@@ -84,6 +84,7 @@
     #notice.error { color: var(--low); }
     #notice.success { color: var(--high); }
     .gallery { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .pager { display: flex; justify-content: center; align-items: center; gap: 12px; margin: 18px; }
     .tile { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); box-shadow: 0 2px 6px rgb(23 43 41 / 4%); }
     .tile[hidden] { display: none; }
     .tile-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; padding: 10px 11px 7px; }
@@ -183,6 +184,7 @@
   <header class="topbar">
     <div class="brand">SAM3 / CAPTURE DATA</div>
     <div class="server-state">ローカルレビュー</div>
+    <button class="small-button" id="finish-work" type="button" hidden>作業完了</button>
   </header>
   <main>
     <section class="intro">
@@ -206,9 +208,10 @@
         <button class="filter" data-filter="high" aria-pressed="false">高</button>
         <button class="filter" data-filter="unchecked" aria-pressed="false">未確認</button>
       </div>
-      <div style="display:flex;align-items:center;gap:12px">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <div class="toolbar-note" id="progress-note"></div>
         <button class="small-button" id="confirm-high">高信頼度を一括YOLO確認済みにする</button>
+        <button class="small-button" id="confirm-session-yolo" title="信頼度・ページ・フィルターに関係なく、採用bboxがある未確認画像が対象です">セッション全体を一括YOLO確認済みにする</button>
       </div>
     </section>
     <section class="publish" aria-label="一括公開">
@@ -221,6 +224,11 @@
     <p class="status-note">信頼度は推論の確認優先度（3段階）です。青い「承認済」は保存済みの承認状態を示し、YOLO確認済み・YOLO公開とは別です。</p>
     <div id="notice" role="status"></div>
     <section class="gallery" id="gallery" aria-live="polite"></section>
+    <nav class="pager" aria-label="レビュー一覧ページ">
+      <button class="secondary" id="previous-page">前へ</button>
+      <span id="page-status"></span>
+      <button class="secondary" id="next-page">次へ</button>
+    </nav>
   </main>
   <dialog id="detail-dialog">
     <div class="detail-head">
@@ -264,17 +272,16 @@
           </div>
           <button class="small-button" id="adopt-dino-box">選択タグにこのDINO候補を採用</button>
           <button class="small-button" id="reject-unused-dino">未判定候補を使わないにする</button>
-          <p class="subtitle">各物体の推論maskを確認してください。mask PNGは「保存して次へ」で承認するまで保存されません。</p>
+          <p class="subtitle">タグごとに採用できるmaskは1つです。採用したタグの残り候補は自動で不採用になります。</p>
           <div class="object-list" id="object-list"></div>
           <p id="object-message" role="status"></p>
-          <p class="subtitle">「保存して次へ」で全物体の判定と画像全体の承認を確定します。YOLO公開は一覧画面で別途行います。</p>
+          <p class="subtitle">採用候補のmaskを確認し、「保存して次へ」で採用候補を保存します。採用候補がない場合は保存できません。</p>
         </div>
       </aside>
     </div>
     <div class="detail-foot">
       <span id="detail-hint">YOLO注釈を修正するとYOLO確認済みは解除されます。保存後に再確認してください。</span>
       <button class="primary" id="save-detail">修正を保存</button>
-      <button class="secondary" id="reject-all-object-review" hidden>すべて不採用で保存して次へ</button>
       <button class="primary" id="save-object-review" hidden>保存して次へ</button>
     </div>
   </dialog>
@@ -312,6 +319,9 @@
     let dinoEditor = null;
     let tagEdits = false;
     let currentFilter = "all";
+    let galleryPage = 0;
+    const galleryPageSize = 50;
+    let detailImageFailed = false;
     let image = null;
     let dragStart = null;
     let previewPoint = null;
@@ -327,6 +337,11 @@
     window.reviewSaveTimings = saveTimings;
     const DRAW_LINE_COLOR = "#ffd400";
     const DRAW_OUTLINE_COLOR = "#111111";
+    const finishWorkButton = document.querySelector("#finish-work");
+    if (window.selectionReturnUrl) {
+      finishWorkButton.hidden = false;
+      finishWorkButton.addEventListener("click", () => window.location.assign(window.selectionReturnUrl));
+    }
 
     function showNotice(message, kind = "") {
       notice.textContent = message;
@@ -448,6 +463,7 @@
       const checked = sessionItems.filter(item => item.reviewed || item.approved).length;
       progressNote.textContent = `YOLO確認済み ${checked} / ${sessionItems.length}`;
       const counts2 = publishCounts(sessionItems);
+      document.querySelector("#confirm-session-yolo").disabled = !selectedSession;
       document.querySelector("#publish-destination").textContent = selectedSession
         ? `公開先: exports/${selectedSession}（公開済みがある場合は exports/${selectedSession}+NNN へ追加）`
         : "公開するセッションがありません";
@@ -473,13 +489,13 @@
       const accepted = objects.filter(object => object.dino_status === "accepted").length;
       const rejected = objects.filter(object => object.dino_status === "rejected").length;
       const pending = objects.length - accepted - rejected;
-      // 画像承認だけでDINOを承認済みにせず、保存済みの物体採否も照合する。
-      const dinoApproved = (item.dino_approved ?? item.approved) && accepted > 0 && pending === 0;
+      // DINOの承認状態は永続化されたDINO専用承認だけを表示し、maskの存在から推定しない。
+      const dinoApproved = Boolean(item.dino_approved);
       let dinoLabel = "未承認";
       if (!objects.length) dinoLabel = "対象なし";
+      else if (dinoApproved) dinoLabel = "承認済";
       else if (pending === objects.length) dinoLabel = "未判定";
       else if (pending > 0) dinoLabel = "判定途中";
-      else if (dinoApproved) dinoLabel = "承認済";
       else if (rejected === objects.length) dinoLabel = "判定済（採用なし）";
       return `
         <div class="review-status" aria-label="モデル別の承認状況">
@@ -493,11 +509,17 @@
       renderSummary();
       const sessionItems = items.filter(item => item.session_id === selectedSession);
       const shown = sessionItems.filter(item => currentFilter === "all" || (currentFilter === "unchecked" ? !item.reviewed && !item.approved : item.confidence === currentFilter));
+      const pageCount = Math.max(1, Math.ceil(shown.length / galleryPageSize));
+      galleryPage = Math.min(galleryPage, pageCount - 1);
+      const pageItems = shown.slice(galleryPage * galleryPageSize, (galleryPage + 1) * galleryPageSize);
+      document.querySelector("#page-status").textContent = `${galleryPage + 1} / ${pageCount} ページ（${shown.length}件）`;
+      document.querySelector("#previous-page").disabled = galleryPage === 0;
+      document.querySelector("#next-page").disabled = galleryPage + 1 >= pageCount;
       if (!shown.length) {
         gallery.innerHTML = `<div class="empty-state">表示する画像はありません。</div>`;
         return;
       }
-      gallery.innerHTML = shown.map(item => `
+      gallery.innerHTML = pageItems.map(item => `
         <article class="tile" data-revision="${item.revision}">
           <div class="tile-head">
             <div class="tile-title"><strong>${escapeHtml(item.image_id)}</strong><small>${escapeHtml(item.capture_date)} / ${escapeHtml(item.session_id)} · ${item.width} × ${item.height}</small><small class="tag-count">物体(タグ) ${item.tags.filter(tag => tag.visible !== false).length}点 / 検出 ${item.annotation.shapes.length}件</small></div>
@@ -522,6 +544,7 @@
         const canvas = tile.querySelector("canvas");
         const thumbImage = new Image();
         thumbImage.onload = () => drawImage(canvas, item, thumbImage);
+        thumbImage.onerror = () => showNotice(`${item.image_id} の画像表示に失敗しました。撮影原本を確認してください。`, "error");
         thumbImage.src = item.image_url;
         tile.querySelector(".reviewed").addEventListener("change", event => updateReviewed(item, event.currentTarget.checked));
         tile.querySelector(".detail-button").addEventListener("click", () => openDetail(item));
@@ -557,6 +580,7 @@
         return;
       }
       selectedItem = structuredClone(item);
+      detailImageFailed = false;
       tagEditor = new TagReview.Editor(selectedItem);
       dinoEditor = new TagReview.DinoEditor(selectedItem);
       tagEdits = false;
@@ -573,10 +597,23 @@
         drawImage(detailCanvas, selectedItem, image, true);
         finishTiming();
       };
+      image.onerror = () => {
+        detailImageFailed = true;
+        const message = `${item.image_id} の画像表示に失敗しました。`;
+        document.querySelector("#tag-message").textContent = message;
+        document.querySelector("#object-message").textContent = message;
+      };
       image.src = item.image_url;
       renderShapeList();
       setDetailMode(mode);
+      updateYoloActions();
       detailDialog.showModal();
+    }
+
+    function updateYoloActions() {
+      const annotation = tagEditor ? tagEditor.annotation(selectedItem.annotation) : selectedItem?.annotation;
+      const hasTargets = Boolean(annotation?.shapes.length);
+      document.querySelector("#save-detail").disabled = !hasTargets;
     }
 
     function setDetailMode(mode) {
@@ -601,13 +638,17 @@
       document.querySelector("#dino-controls").hidden = mode !== "dino";
       document.querySelector("#save-detail").hidden = mode !== "yolo";
       document.querySelector("#save-object-review").hidden = mode !== "dino";
-      document.querySelector("#reject-all-object-review").hidden = mode !== "dino";
       document.querySelector("#detail-hint").hidden = mode === "dino";
       detailCanvas.style.cursor = mode === "dino" ? "pointer" : tagEditor?.mode === "draw" ? "crosshair" : "pointer";
       if (mode === "dino") {
-        // 既存の不採用は変えず、未判定かつ器具対応済みの物体だけを初期選択する。
-        for (const object of selectedItem.objects || []) {
-          if (object.dino_status === "pending" && object.instrument_uid && object.instance_no !== null) object.dino_status = "accepted";
+        // 採用済みがなければ、タグに対応済みの先頭候補を初期採用し、同じタグの残りを不採用にする。
+        for (const [index, tag] of dinoEditor.tags.entries()) {
+          const accepted = dinoEditor.assigned(index)[0];
+          const candidate = accepted || selectedItem.objects.find(object =>
+            object.dino_status === "pending"
+            && object.instrument_uid === tag.instrument_uid
+            && object.instance_no === tag.instance_no);
+          if (candidate) dinoEditor.adopt(candidate);
         }
         const assigned = dinoEditor.assigned(dinoEditor.selectedTag)[0];
         if (assigned) focusedObject = assigned.object_index;
@@ -630,6 +671,7 @@
       document.querySelector("#previous-dino-tag").disabled = dinoEditor.selectedTag === null || dinoEditor.selectedTag === 0;
       document.querySelector("#next-dino-tag").disabled = dinoEditor.selectedTag === null || dinoEditor.selectedTag === dinoEditor.tags.length - 1;
       document.querySelector("#adopt-dino-box").disabled = dinoEditor.selectedTag === null || focusedObject === null;
+      updateDinoSaveAvailability();
       document.querySelector("#object-list").innerHTML = objects.map(object => `
         <div class="object-row" data-object="${object.object_index}" style="border-left:4px solid ${object.instrument_uid ? TagReview.color(dinoEditor.tags.findIndex(tag => tag.instrument_uid === object.instrument_uid && tag.instance_no === object.instance_no)) : "#647572"};padding-left:6px;background:${object.object_index === focusedObject ? "#edf3fa" : "transparent"}">
           <label><input type="radio" name="focused-object" value="${object.object_index}" ${object.object_index === focusedObject ? "checked" : ""}>
@@ -718,7 +760,7 @@
       document.querySelector("#object-message").textContent = object ? "確認用maskを生成・読み込み中（必要に応じてSAM3推論を実行）" : "推論物体がありません。";
       if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
       if (!object) {
-        document.querySelector("#save-object-review").disabled = false;
+        updateDinoSaveAvailability();
         return;
       }
       const overlay = new Image();
@@ -727,8 +769,9 @@
         maskOverlay = overlay;
         viewedObjects.add(object.object_index);
         renderObjectList();
-        document.querySelector("#save-object-review").disabled = false;
-        document.querySelector("#object-message").textContent = `mask確認 ${viewedObjects.size} / ${selectedItem.objects.length}物体 · 保存して次へでPNG保存`;
+        const acceptedCount = (selectedItem.objects || []).filter(item => item.dino_status === "accepted").length;
+        const viewedAccepted = (selectedItem.objects || []).filter(item => item.dino_status === "accepted" && viewedObjects.has(item.object_index)).length;
+        document.querySelector("#object-message").textContent = `採用mask確認 ${viewedAccepted} / ${acceptedCount}件`;
         if (image?.complete && image.naturalWidth) drawImage(detailCanvas, selectedItem, image, true);
       };
       overlay.onerror = () => {
@@ -764,26 +807,32 @@
 
     function setSavingState(saving) {
       savingReview = saving;
-      for (const selector of ["#save-object-review", "#reject-all-object-review"]) document.querySelector(selector).ariaBusy = String(saving);
+      document.querySelector("#save-object-review").ariaBusy = String(saving);
       if (saving) document.querySelector("#object-message").textContent = "保存中…（完了まで次の画像へ進みません）";
     }
 
-    async function saveObjectReview(rejectAll) {
+    function updateDinoSaveAvailability() {
+      const accepted = (selectedItem?.objects || []).filter(object => object.dino_status === "accepted");
+      const acceptedMasksViewed = accepted.every(object => viewedObjects.has(object.object_index));
+      document.querySelector("#save-object-review").disabled = accepted.length === 0 || !acceptedMasksViewed;
+    }
+
+    async function saveObjectReview() {
       if (savingReview) return;
       const controls = [...detailDialog.querySelectorAll("button, input, select")].map(element => [element, element.disabled]);
-      const timing = {mode: rejectAll ? "reject_all" : "normal", start: performance.now()};
+      const timing = {mode: "tag_review", start: performance.now()};
       let saved = false;
       let next;
       let latestItems = null;
       try {
+        if (detailImageFailed) throw new Error("画像を表示できないため、DINO判定を保存できません。未保存の編集は保持しています。");
         const reviewer = document.querySelector("#reviewer").value.trim();
         if (!reviewer) throw new Error("一度閉じて、画面上部の確認担当者を入力してください。未保存の変更がある場合は破棄の確認が表示されます。");
-        // 全不採用は明示操作のため個別閲覧を求めず、通常保存の確認条件は変えない。
-        const objects = rejectAll
-          ? (selectedItem.objects || []).map(object => ({...object, dino_status: "rejected", instrument_uid: null, instance_no: null}))
-          : selectedItem.objects || [];
-        if (!rejectAll && objects.some(object => object.dino_status === "pending")) throw new Error("未判定の物体がある。「使う／使わない」を選択してください");
-        if (!rejectAll && objects.some(object => !viewedObjects.has(object.object_index))) throw new Error("各物体を選択し、すべての原本マスクを確認してください");
+        const objects = selectedItem.objects || [];
+        const accepted = objects.filter(object => object.dino_status === "accepted");
+        if (!accepted.length) throw new Error("採用されたmaskがないため、DINO保存対象がありません。");
+        if (accepted.some(object => !viewedObjects.has(object.object_index))) throw new Error("採用したmaskを確認してください。");
+        const decisions = objects.filter(object => object.dino_status !== "pending");
         const current = items.find(item => item.revision === selectedItem.revision);
         if (JSON.stringify(current.annotation) !== JSON.stringify(selectedItem.annotation)) throw new Error("YOLO矩形に未保存の変更がある。先に「修正を保存」を実行してください");
         setSavingState(true);
@@ -796,7 +845,7 @@
         if (!latest) throw new Error("レビュー版が更新されました。画面を開き直してください");
         const latestByIndex = new Map(latest.objects.map(object => [object.object_index, object]));
         if (objects.length !== latestByIndex.size || objects.some(object => !latestByIndex.has(object.object_index))) throw new Error("候補が更新されました。画面を開き直してください");
-        const overwriteMasks = objects.some(object => object.dino_status === "accepted" && latestByIndex.get(object.object_index).saved_mask_exists);
+        const overwriteMasks = accepted.some(object => latestByIndex.get(object.object_index).saved_mask_exists);
         if (overwriteMasks && !await confirmMaskOverwrite()) {
           document.querySelector("#object-message").textContent = "保存を中止しました。既存maskと判定は変更していません。";
           return;
@@ -804,13 +853,13 @@
         started = performance.now();
         await request("/api/complete-review", "POST", {revision: selectedItem.revision, reviewer, confirm_complete: true,
           overwrite_masks: overwriteMasks,
-          decisions: objects.map(object => ({object_index: object.object_index, status: object.dino_status})),
-          assignments: objects.map(object => ({object_index: object.object_index, instrument_uid: object.instrument_uid, instance_no: object.instance_no})),
+          decisions: decisions.map(object => ({object_index: object.object_index, status: object.dino_status})),
+          assignments: decisions.map(object => ({object_index: object.object_index, instrument_uid: object.instrument_uid, instance_no: object.instance_no})),
           allow_empty: selectedItem.allow_empty, exception_note: selectedItem.exception_note});
         timing.save_api_ms = performance.now() - started;
         // 成功済みの採否を保持し、一覧の再読込失敗時も保存漏れと誤認させない。YOLO確認状態は変えない。
         current.objects = structuredClone(objects);
-        current.dino_approved = objects.some(object => object.dino_status === "accepted");
+        current.dino_approved = accepted.length > 0;
         const sessionItems = items.filter(item => item.session_id === selectedItem.session_id);
         const nextRevision = sessionItems[sessionItems.findIndex(item => item.revision === selectedItem.revision) + 1]?.revision;
         // 保存直前に取得した最新一覧から次画像を開き、保存後の全件再取得を待たない。
@@ -824,6 +873,7 @@
       }
       if (saved) {
         detailDialog.close();
+        renderGallery();
         if (next) {
           timing.next_image_start = performance.now();
           pendingTiming = timing;
@@ -841,11 +891,7 @@
       }
     }
 
-    document.querySelector("#save-object-review").addEventListener("click", () => saveObjectReview(false));
-    document.querySelector("#reject-all-object-review").addEventListener("click", () => {
-      if (!window.confirm("この画像のDINO候補をすべて不採用として保存し、既存の採用を解除しますか？")) return;
-      return saveObjectReview(true);
-    });
+    document.querySelector("#save-object-review").addEventListener("click", saveObjectReview);
 
     function renderShapeList() {
       if (!tagEditor) return;
@@ -905,6 +951,7 @@
       selectedItem.annotation = tagEditor.annotation(selectedItem.annotation);
       tagEdits = true;
       document.querySelector("#tag-message").textContent = "";
+      updateYoloActions();
       refreshTagReview();
     }
 
@@ -929,7 +976,6 @@
         syncTagAnnotation();
       }
     });
-
     function canvasPoint(event) {
       const bounds = detailCanvas.getBoundingClientRect();
       return {
@@ -995,9 +1041,11 @@
 
     document.querySelector("#save-detail").addEventListener("click", async () => {
       try {
+        if (detailImageFailed) throw new Error("画像を表示できないため、YOLO修正を保存できません。未保存の編集は保持しています。");
         const current = items.find(item => item.revision === selectedItem.revision);
         if (JSON.stringify(current.objects) !== JSON.stringify(selectedItem.objects)) throw new Error("DINO判定に未保存の変更がある。先に「保存して次へ」を実行してください");
         selectedItem.annotation = tagEditor.annotation(selectedItem.annotation);
+        if (!selectedItem.annotation.shapes.length) throw new Error("採用bboxがないため、YOLO注釈の保存対象がありません。");
         await request("/api/annotation", "POST", {revision: selectedItem.revision, annotation: selectedItem.annotation});
         // 確認状態の保存失敗も詳細画面で通知し、成功として閉じない。
         await request("/api/reviewed", "POST", {revision: selectedItem.revision, reviewed: document.querySelector("#detail-reviewed").checked});
@@ -1046,10 +1094,19 @@
     for (const button of document.querySelectorAll(".filter")) {
       button.addEventListener("click", () => {
         currentFilter = button.dataset.filter;
+        galleryPage = 0;
         for (const candidate of document.querySelectorAll(".filter")) candidate.setAttribute("aria-pressed", String(candidate === button));
         renderGallery();
       });
     }
+    document.querySelector("#previous-page").addEventListener("click", () => {
+      galleryPage--;
+      renderGallery();
+    });
+    document.querySelector("#next-page").addEventListener("click", () => {
+      galleryPage++;
+      renderGallery();
+    });
 
     document.querySelector("#confirm-high").addEventListener("click", async () => {
       const highItems = items.filter(item => item.session_id === selectedSession && item.confidence === "high" && !item.approved);
@@ -1060,6 +1117,42 @@
         showNotice(`高信頼度 ${highItems.length} 件を確認済みにしました。`, "success");
       } catch (error) {
         showNotice(error.message, "error");
+      }
+    });
+
+    document.querySelector("#confirm-session-yolo").addEventListener("click", async () => {
+      const sessionItems = items.filter(item => item.session_id === selectedSession);
+      const targets = sessionItems.filter(item => !item.reviewed && !item.approved && item.annotation.shapes.length > 0);
+      if (!targets.length) {
+        showNotice("一括確認できる未確認画像がありません（採用bboxがある画像だけが対象です）。", "error");
+        return;
+      }
+
+      const button = document.querySelector("#confirm-session-yolo");
+      button.disabled = true;
+      try {
+        const results = await Promise.allSettled(targets.map(item =>
+          request("/api/reviewed", "POST", {revision: item.revision, reviewed: true})
+        ));
+        let confirmed = 0;
+        const failures = [];
+        results.forEach((result, index) => {
+          if (result.status === "fulfilled") {
+            targets[index].reviewed = true;
+            confirmed += 1;
+          } else {
+            failures.push(result.reason);
+          }
+        });
+        renderGallery();
+        if (failures.length) {
+          const firstError = failures[0] instanceof Error ? failures[0].message : String(failures[0]);
+          showNotice(`一括確認は一部のみ完了しました: ${confirmed}件成功、${failures.length}件失敗。失敗例: ${firstError}`, "error");
+          return;
+        }
+        showNotice(`セッション内の未確認画像 ${confirmed}件をYOLO確認済みにしました。`, "success");
+      } finally {
+        button.disabled = false;
       }
     });
 
@@ -1082,6 +1175,7 @@
 
     document.querySelector("#session-select").addEventListener("change", event => {
       selectedSession = event.currentTarget.value;
+      galleryPage = 0;
       document.querySelector("#confirm-complete").checked = false;
       renderGallery();
     });
@@ -1089,6 +1183,7 @@
     document.querySelector("#date-select").addEventListener("change", event => {
       selectedDate = event.currentTarget.value;
       renderSessionPicker();
+      galleryPage = 0;
       document.querySelector("#confirm-complete").checked = false;
       renderGallery();
     });

@@ -38,6 +38,7 @@ from sam3_pipeline.infrastructure.matching import ArrayMask
 from sam3_pipeline.infrastructure.object_review_store import SqliteObjectReviewStore
 from sam3_pipeline.infrastructure.prediction_store import SqlitePredictionStore
 from sam3_pipeline.infrastructure.review_server import BatchReviewServer
+from sam3_pipeline.infrastructure.selection_server import SelectiveInferenceServer
 from sam3_pipeline.infrastructure.session_database import session_database
 
 IMAGE_SIZE = 8
@@ -138,39 +139,101 @@ def _publish(workflow: Workflow, sample: CaptureSample) -> Path:
     return workflow.store.export_approved(workflow.store.root / "exports" / sample.session_id, sample.session_id)
 
 
-@pytest.mark.parametrize("status,ready", [("accepted", 1), ("rejected", 0)])
-def test_complete_review_saves_decisions_and_approval_without_export(workflow: Workflow, status: str, ready: int) -> None:
-    """一括確定で画像と採否を保存し、DINOだけを条件付き公開する。"""
+def test_complete_review_saves_accepted_decision_without_export(workflow: Workflow) -> None:
+    """採用候補を一括保存し、DINOだけを条件付き公開する。"""
     sample = workflow.samples[0]
     revision = workflow.revisions[sample.session_id]
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
 
-    server._complete_review({"revision": revision, "reviewer": " operator ", "confirm_complete": True, "decisions": [{"object_index": 0, "status": status}]})
+    server._complete_review({"revision": revision, "reviewer": " operator ", "confirm_complete": True,
+                             "decisions": [{"object_index": 0, "status": "accepted"}]})
 
     assert workflow.reviews.approved(revision)
-    assert workflow.reviews.objects(sample, revision)[0]["dino_status"] == status
+    assert workflow.reviews.objects(sample, revision)[0]["dino_status"] == "accepted"
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert item["dino_approved"]
+    assert item["objects"][0]["dino_status"] == "accepted"
+    assert item["objects"][0]["saved_mask_exists"]
+    workflow.store.sync_object_reviews()
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert item["dino_approved"]
+    assert item["objects"][0]["dino_status"] == "accepted"
+    assert item["objects"][0]["saved_mask_exists"]
     assert read_json(workflow.store.root / "approvals" / f"{revision}.json")["reviewer"] == "operator"
-    assert _flags(workflow, sample) == (ready, 0)
+    assert _flags(workflow, sample) == (1, 0)
     assert _flags(workflow, workflow.samples[1]) == (0, 0)
     assert not (workflow.store.root / "exports").exists()
     target = session_database(workflow.root, sample.session_id).parent / "masks" / "image_000.png"
     candidates = workflow.predictions.load(sample, workflow.reviews.objects(sample, revision)[0]["prediction_id"])
     assert candidates is not None
-    if status == "accepted":
-        with Image.open(target) as mask:
-            assert np.array_equal(np.asarray(mask) > 0, candidates[0].mask.pixels)
-    else:
-        assert not target.exists()
+    with Image.open(target) as mask:
+        assert np.array_equal(np.asarray(mask) > 0, candidates[0].mask.pixels)
     assert not list((workflow.root / "annotations").rglob("*.png"))
-    assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"] == (status == "accepted")
+    assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"]
     with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
-        if status == "accepted":
-            expected = (target.relative_to(workflow.root).as_posix(), digest_file(target))
-            assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone() == expected
-            assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_objects WHERE revision=?", (revision,)).fetchone() == expected
-        else:
-            assert connection.execute("SELECT mask_path FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone()[0].startswith("memory:")
-            assert connection.execute("SELECT COUNT(*) FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchone() == (0,)
+        expected = (target.relative_to(workflow.root).as_posix(), digest_file(target))
+        assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_results WHERE revision=?", (revision,)).fetchone() == expected
+        assert connection.execute("SELECT mask_path, mask_sha256 FROM sam3_dino_objects WHERE revision=?", (revision,)).fetchone() == expected
+
+
+def test_complete_review_rejects_save_without_an_accepted_mask(workflow: Workflow) -> None:
+    """採用maskが0件なら承認・採否・maskを保存しない。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    with pytest.raises(CaptureError, match="採用されたmaskがない"):
+        server._complete_review({
+            "revision": revision,
+            "reviewer": "operator",
+            "confirm_complete": True,
+            "decisions": [{"object_index": 0, "status": "rejected"}],
+            "assignments": [{"object_index": 0, "instrument_uid": None, "instance_no": None}],
+        })
+
+    assert not workflow.reviews.approved(revision)
+    assert workflow.reviews.objects(sample, revision)[0]["dino_status"] == "pending"
+    assert not (workflow.store.root / "approvals" / f"{revision}.json").exists()
+    assert not (session_database(workflow.root, sample.session_id).parent / "masks" / "image_000.png").exists()
+
+
+def test_complete_review_saves_selected_tag_and_leaves_other_candidates_pending(workflow: Workflow) -> None:
+    """採用タグだけ保存し、未確認の別候補はpendingのまま残す。"""
+    sample = workflow.samples[0]
+    pixels = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=bool)
+    pixels[2:6, 2:6] = True
+    candidates = tuple(
+        Candidate(index, (1.0 + index, 2.0, 5.0 + index, 6.0), 0.9, ArrayMask(np.roll(pixels, index, axis=1)))
+        for index in range(3)
+    )
+    signature = f"{SIGNATURE}-partial-review"
+    prediction_id = hashlib.sha256(f"{sample.sha256}:{signature}".encode()).hexdigest()
+    workflow.predictions.save(sample, prediction_id, candidates, signature)
+    revision = workflow.store.save_draft(
+        sample, candidates, MatchResult((Assignment(0, "tool", 1),), ()), prediction_id, "partial-review"
+    )
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review({
+        "revision": revision,
+        "reviewer": "operator",
+        "confirm_complete": True,
+        "decisions": [{"object_index": 0, "status": "accepted"}, {"object_index": 1, "status": "rejected"}],
+        "assignments": [
+            {"object_index": 0, "instrument_uid": "tool", "instance_no": 1},
+            {"object_index": 1, "instrument_uid": None, "instance_no": None},
+        ],
+    })
+
+    objects = workflow.reviews.objects(sample, revision)
+    assert [item["dino_status"] for item in objects] == ["accepted", "rejected", "pending"]
+    assert [item["saved_mask_exists"] for item in objects] == [True, False, False]
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert item["dino_approved"] and not item["approved"]
+    with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
+        assert connection.execute(
+            "SELECT object_index FROM sam3_dino_results WHERE revision=? AND is_dino_ready=1", (revision,)
+        ).fetchall() == [(0,)]
 
 
 @pytest.mark.parametrize("consent", [False, True])
@@ -218,7 +281,7 @@ def test_complete_review_overwrite_sql_failure_restores_previous_mask(workflow: 
             WHEN NEW.status='approved' BEGIN SELECT RAISE(ABORT, '承認更新失敗'); END""")
 
     with pytest.raises(CaptureError, match="承認更新失敗"):
-        server._complete_review({**payload, "overwrite_masks": True, "decisions": [{"object_index": 0, "status": "rejected"}]})
+        server._complete_review({**payload, "overwrite_masks": True})
 
     assert target.read_bytes() == previous
     assert _flags(workflow, sample) == (1, 0)
@@ -320,12 +383,8 @@ def test_complete_review_multiple_objects_are_saved_together(workflow: Workflow)
     signature = f"{SIGNATURE}-two-objects"
     prediction_id = hashlib.sha256(f"{sample.sha256}:{signature}".encode()).hexdigest()
     workflow.predictions.save(sample, prediction_id, candidates, signature)
-    # タグ数との差異は例外理由で明示し、全矩形を残したままDINO採否だけを分離する。
+    # タグ未対応のbboxも比較用候補として保全し、DINO採否だけを分離する。
     revision = workflow.store.save_draft(sample, candidates, MatchResult((Assignment(0, "tool", 1),), ()), prediction_id, "two-objects")
-    annotation_path = workflow.store.root / "reviews" / revision / "annotation.json"
-    annotation = read_json(annotation_path)
-    annotation["shapes"][1]["label"] = "tool"
-    atomic_json(annotation_path, annotation)
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
 
     server._complete_review(
@@ -334,7 +393,10 @@ def test_complete_review_multiple_objects_are_saved_together(workflow: Workflow)
 
     assert [item["dino_status"] for item in workflow.reviews.objects(sample, revision)] == ["accepted", "rejected"]
     assert workflow.reviews.approved(revision)
-    assert len(read_json(workflow.store.root / "reviews" / revision / "annotation.json")["shapes"]) == len(candidates)
+    saved_annotation = read_json(workflow.store.root / "reviews" / revision / "annotation.json")
+    assert len(saved_annotation["shapes"]) + len(saved_annotation["review_candidates"]) == len(candidates)
+    assert len(saved_annotation["review_candidates"]) == 1
+    assert saved_annotation["review_candidates"][0]["label"] == "__unresolved__"
     with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
         assert connection.execute("SELECT object_index FROM sam3_dino_results WHERE revision=? AND is_dino_ready=1", (revision,)).fetchall() == [(0,)]
 
@@ -402,6 +464,49 @@ def test_dino_manual_selection_accepts_one_low_score_candidate_and_survives_rest
         assert connection.execute("SELECT object_index, previous_uid, instrument_uid, instance_no FROM sam3_object_assignment_events WHERE revision=?", (revision,)).fetchall() == [(1, None, "tool", 1)]
 
 
+def test_dino_review_allows_assigning_only_some_decided_candidates(workflow: Workflow) -> None:
+    """判定する候補のうち一部だけタグ対応を指定できる。"""
+    revision, payload = _ambiguous_dino(workflow)
+    sample = workflow.samples[0]
+    payload["decisions"] = [
+        {"object_index": 1, "status": "accepted"},
+        {"object_index": 2, "status": "rejected"},
+    ]
+    payload["assignments"] = [
+        {"object_index": 1, "instrument_uid": "tool", "instance_no": 1},
+    ]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review(payload)
+
+    objects = workflow.reviews.objects(sample, revision)
+    assert [item["dino_status"] for item in objects] == ["pending", "accepted", "rejected"]
+
+
+def test_dino_acceptance_rejects_unmentioned_candidates_for_the_same_tag(workflow: Workflow) -> None:
+    """APIで1候補だけ採用した場合も、同じタグの未指定候補を自動で不採用にする。"""
+    revision, _ = _ambiguous_dino(workflow)
+    sample = workflow.samples[0]
+    with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection, connection:
+        connection.execute(
+            "UPDATE sam3_object_reviews SET instrument_uid='tool', instance_no=1 WHERE revision=? AND object_index IN (0, 2)",
+            (revision,),
+        )
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review({
+        "revision": revision,
+        "reviewer": "operator",
+        "confirm_complete": True,
+        "decisions": [{"object_index": 1, "status": "accepted"}],
+        "assignments": [{"object_index": 1, "instrument_uid": "tool", "instance_no": 1}],
+    })
+
+    objects = workflow.reviews.objects(sample, revision)
+    assert [item["dino_status"] for item in objects] == ["rejected", "accepted", "rejected"]
+    assert [item["saved_mask_exists"] for item in objects] == [False, True, False]
+
+
 def _seed_old_masks(workflow: Workflow, revision: str) -> Path:
     """旧バグで全候補を保存した状態を一時DBに作る。"""
     database = session_database(workflow.root, workflow.samples[0].session_id)
@@ -429,12 +534,24 @@ def test_dino_cleanup_removes_rejected_masks_without_overwrite_consent(workflow:
         assignment.update(instrument_uid="tool" if accepted else None, instance_no=1 if accepted else None)
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
 
+    if selected is None:
+        previous_masks = {path: path.read_bytes() for path in directory.glob("*.png")}
+        with pytest.raises(CaptureError, match="採用されたmaskがない"):
+            server._complete_review(payload)
+        assert {path: path.read_bytes() for path in directory.glob("*.png")} == previous_masks
+        assert all(item["dino_status"] == "pending" for item in workflow.reviews.objects(sample, revision))
+        with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM sam3_object_review_events WHERE revision=?", (revision,)
+            ).fetchone() == (0,)
+        return
+
     server._complete_review(payload)
 
-    expected = [] if selected is None else [f"image_{selected:03d}.png"]
+    expected = [f"image_{selected:03d}.png"]
     assert sorted(path.name for path in directory.glob("*.png")) == expected
     with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
-        assert connection.execute("SELECT object_index FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchall() == ([] if selected is None else [(selected,)])
+        assert connection.execute("SELECT object_index FROM sam3_approved_masks WHERE revision=?", (revision,)).fetchall() == [(selected,)]
         rows = connection.execute("SELECT object_index, mask_path, is_dino_ready FROM sam3_dino_results WHERE revision=? ORDER BY object_index", (revision,)).fetchall()
         assert len(rows) == len(payload["decisions"])
         for index, path, ready in rows:
@@ -607,7 +724,7 @@ def test_dino_cleanup_refuses_unsafe_ownership(workflow: Workflow, conflict: str
         assert list(connection.iterdump()) == before_sql
 
 
-@pytest.mark.parametrize("damage", ["duplicate", "unknown", "partial", "boolean", "unresolved", "index"])
+@pytest.mark.parametrize("damage", ["duplicate", "unknown", "boolean", "unresolved", "index"])
 def test_dino_invalid_manual_selection_keeps_assignment_history_empty(workflow: Workflow, damage: str) -> None:
     """不正な手動対応は採否・履歴・maskを部分保存しない。
 
@@ -621,8 +738,6 @@ def test_dino_invalid_manual_selection_keeps_assignment_history_empty(workflow: 
         payload["decisions"][0]["status"] = "accepted"
     elif damage == "unknown":
         payload["assignments"][1]["instrument_uid"] = "missing"
-    elif damage == "partial":
-        payload["assignments"].pop()
     elif damage == "boolean":
         payload["assignments"][1]["instance_no"] = True
     elif damage == "unresolved":
@@ -706,15 +821,40 @@ def test_dino_manual_selection_preserves_current_yolo_publication(workflow: Work
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
 
     server._complete_review(
-        {"revision": revision, "reviewer": "dino-operator", "confirm_complete": True, "overwrite_masks": True, "decisions": [{"object_index": 0, "status": "rejected"}], "assignments": [{"object_index": 0, "instrument_uid": "tool", "instance_no": 1}]}
+        {"revision": revision, "reviewer": "dino-operator", "confirm_complete": True, "overwrite_masks": True, "decisions": [{"object_index": 0, "status": "accepted"}], "assignments": [{"object_index": 0, "instrument_uid": "tool", "instance_no": 1}]}
     )
 
-    assert _flags(workflow, sample) == (0, 1)
+    assert _flags(workflow, sample) == (1, 1)
     assert approval.read_bytes() == before
     assert manifest.is_file()
     assert workflow.reviews.objects(sample, revision)[0]["reviewer"] == "dino-operator"
     item = next(item for item in server._items() if item["revision"] == revision)
     assert item["approved"]
+
+
+def test_selection_catalog_marks_dino_approved_with_preserved_yolo_scope(workflow: Workflow) -> None:
+    """有効なYOLO承認scopeを維持したDINO保存を選択一覧にも反映する。"""
+    sample = workflow.samples[0]
+    _publish(workflow, sample)
+    revision = workflow.revisions[sample.session_id]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._complete_review(
+        {
+            "revision": revision,
+            "reviewer": "dino-operator",
+            "confirm_complete": True,
+            "overwrite_masks": True,
+            "decisions": [{"object_index": 0, "status": "accepted"}],
+            "assignments": [{"object_index": 0, "instrument_uid": "tool", "instance_no": 1}],
+        }
+    )
+
+    assert workflow.reviews.objects(sample, revision)[0]["saved_mask_exists"]
+    selection = SelectiveInferenceServer(workflow.store.capture_source, workflow.store, workflow.reviews)
+    selected_item = selection._with_status(selection.entry_by_identity[(sample.session_id, sample.image_id)])
+    assert selected_item["yolo"] == "承認済み"
+    assert selected_item["dino"] == "承認済み"
 
 
 def test_review_items_capture_date_comes_from_source_path(workflow: Workflow) -> None:
@@ -777,6 +917,46 @@ def test_session_outputs_prediction_details_and_initial_flags(workflow: Workflow
             assert connection.execute("SELECT COUNT(*) FROM sam3_predictions").fetchone()[0] == 1
         assert _flags(workflow, sample) == (0, 0)
     assert not (workflow.root / "metadata.sqlite3").exists()
+
+
+def test_sync_object_reviews_migrates_unmodified_legacy_initial_annotation(workflow: Workflow) -> None:
+    """レビュー起動時の同期でも、未編集の旧初期草案を移行する。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    annotation_path = workflow.store.root / "reviews" / revision / "annotation.json"
+    annotation = read_json(annotation_path)
+    annotation["shapes"].extend(annotation.pop("review_candidates"))
+    annotation.pop("tag_review_version")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
+    atomic_json(annotation_path, annotation)
+
+    workflow.store.sync_object_reviews()
+
+    migrated = read_json(annotation_path)
+    assert migrated["tag_review_version"] == 1
+    assert len(migrated["shapes"]) == 1
+    assert migrated["shapes"][0]["tag_assignment"] == {"instrument_uid": "tool", "instance_no": 1}
+
+
+def test_sync_object_reviews_preserves_edited_legacy_initial_annotation(workflow: Workflow) -> None:
+    """旧初期草案でも人手編集があればレビュー起動時に変更しない。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    annotation_path = workflow.store.root / "reviews" / revision / "annotation.json"
+    annotation = read_json(annotation_path)
+    annotation["shapes"].extend(annotation.pop("review_candidates"))
+    annotation.pop("tag_review_version")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
+    annotation["shapes"][0]["points"][0][0] = 1.0
+    atomic_json(annotation_path, annotation)
+
+    workflow.store.sync_object_reviews()
+
+    saved = read_json(annotation_path)
+    assert "tag_review_version" not in saved
+    assert saved["shapes"][0]["points"][0][0] == 1.0
 
 
 @pytest.mark.parametrize("target", ["dino", "yolo"])
@@ -1042,7 +1222,7 @@ def test_session_outputs_missing_database_never_recreates(workflow: Workflow) ->
 
 
 def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow, monkeypatch: pytest.MonkeyPatch) -> None:
-    """通常runもモデルだけを代替して各セッションの専用テーブルへ結果を保存する。"""
+    """通常runは選択画像だけを各セッションの専用テーブルへ保存する。"""
     signature = "cli-native-model"
     pixels = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=bool)
     pixels[2:6, 2:6] = True
@@ -1054,6 +1234,9 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
         def __init__(self) -> None:
             """推論キーに使用するモデル署名を設定する。"""
             self.signature: str = signature
+
+        def initialize(self) -> None:
+            """実モデルの事前初期化APIをテスト用予測器に合わせる。"""
 
         def infer(self, _sample: CaptureSample) -> tuple[Candidate, ...]:
             """入力画像へ確定済みの候補を返す。
@@ -1095,19 +1278,37 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
         },
     )
     monkeypatch.setattr(capture_workflow, "Sam3CapturePredictor", create_predictor)
-    monkeypatch.setattr(BatchReviewServer, "serve", lambda _self: None)
+    chosen = workflow.samples[0]
+    def select_chosen_image(selection: SelectiveInferenceServer) -> list[tuple[str, str]]:
+        selection.url = "http://127.0.0.1:12345/"
+        return [(chosen.session_id, chosen.image_id)]
+
+    monkeypatch.setattr(capture_workflow.SelectiveInferenceServer, "select", select_chosen_image)
+    monkeypatch.setattr(BatchReviewServer, "serve", lambda _self, **_kwargs: None)
 
     result = main(["--config", str(config), "run"])
 
     assert result == 0
     for sample in workflow.samples:
         with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
-            assert connection.execute("SELECT prompt, min_score, is_dino_ready FROM sam3_dino_results WHERE model_signature=?", (signature,)).fetchall() == [("instrument", 0.45, 0)]
+            actual = connection.execute("SELECT prompt, min_score, is_dino_ready FROM sam3_dino_results WHERE model_signature=?", (signature,)).fetchall()
+            expected = [("instrument", 0.45, 0)] if sample == chosen else []
+            assert actual == expected
     assert not (workflow.root / "metadata.sqlite3").exists()
 
 
+def test_review_page_embeds_live_selection_return_url(workflow: Workflow) -> None:
+    """runレビュー画面だけに稼働中selection serverのURLを注入する。"""
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+    server.selection_return_url = "http://127.0.0.1:12345/?review_complete=1"
+
+    page = server._review_page()
+
+    assert b"window.selectionReturnUrl = \"http://127.0.0.1:12345/?review_complete=1\"" in page
+
+
 def test_review_server_partial_publish_keeps_yolo_independent_of_dino_and_edit_clears(workflow: Workflow) -> None:
-    """DINO全不採用保存はYOLO確認・公開を変えず、YOLO編集は確認と承認表示を解除する。"""
+    """DINO部分保存はYOLO確認・公開を変えず、YOLO編集は確認と承認表示を解除する。"""
     sample = workflow.samples[0]
     revision = workflow.revisions[sample.session_id]
     server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
@@ -1116,15 +1317,57 @@ def test_review_server_partial_publish_keeps_yolo_independent_of_dino_and_edit_c
     before = manifest.read_bytes()
 
     server._complete_review({"revision": revision, "reviewer": "operator", "confirm_complete": True,
-                             "decisions": [{"object_index": 0, "status": "rejected"}],
-                             "assignments": [{"object_index": 0, "instrument_uid": None, "instance_no": None}]})
+                             "decisions": [{"object_index": 0, "status": "accepted"}],
+                             "assignments": [{"object_index": 0, "instrument_uid": "tool", "instance_no": 1}]})
 
     item = next(item for item in server._items() if item["revision"] == revision)
     assert item["reviewed"] and item["approved"] and item["published"]
+    assert item["dino_approved"]
+    assert item["objects"][0]["dino_status"] == "accepted"
+    assert item["objects"][0]["saved_mask_exists"]
     assert _flags(workflow, sample)[1] == 1
     assert manifest.read_bytes() == before
+    workflow.store.sync_object_reviews()
+    item = next(item for item in server._items() if item["revision"] == revision)
+    assert item["dino_approved"]
+    assert item["objects"][0]["dino_status"] == "accepted"
+    assert item["objects"][0]["saved_mask_exists"]
     annotation = json.loads((workflow.store.root / "reviews" / revision / "annotation.json").read_text(encoding="utf-8"))
     annotation["shapes"][0]["points"][1][0] -= 1
     server._save_annotation({"revision": revision, "annotation": annotation})
     item = next(item for item in server._items() if item["revision"] == revision)
     assert not item["reviewed"] and not item["approved"] and not item["published"]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [("label", "not-a-declared-uid"), ("shape_type", "polygon")],
+)
+def test_batch_publish_error_identifies_image_shape_and_field(
+    workflow: Workflow,
+    field: str,
+    invalid_value: str,
+) -> None:
+    """公開検証エラーに画像ID、shape index、違反フィールドを含め、承認前に停止する。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+    server._set_reviewed({"revision": revision, "reviewed": True})
+
+    annotation_path = workflow.store.root / "reviews" / revision / "annotation.json"
+    annotation = read_json(annotation_path)
+    annotation["shapes"][0][field] = invalid_value
+    atomic_json(annotation_path, annotation)
+
+    with pytest.raises(
+        CaptureError,
+        match=rf"image ID {sample.image_id}: shape index 0 field '{field}'",
+    ):
+        server._publish({
+            "reviewer": "operator",
+            "session_id": sample.session_id,
+            "confirm_complete": True,
+        })
+
+    assert not workflow.reviews.approved(revision, scope="yolo")
+    assert not (workflow.store.root / "exports").exists()

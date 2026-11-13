@@ -1,7 +1,8 @@
 """Adapt the existing SAM3 wrapper to one shared text prompt per capture image.
 
 Explicit local checkpoints and implementation fingerprints make cache reuse
-traceable. Model loading is lazy so cached tag reassignment needs no GPU memory.
+traceable. Cache-only workflows can defer model loading; run initializes before
+opening the selection viewer.
 """
 
 from __future__ import annotations
@@ -70,6 +71,21 @@ class Sam3CapturePredictor:
         """Return the fully resolved prediction recipe fingerprint."""
         return self._signature
 
+    def initialize(self) -> None:
+        """Load the SAM3 engine before an interactive workflow is opened."""
+        if self.engine is not None:
+            return
+
+        from sam3_pipeline.engine import Sam3Engine  # noqa: PLC0415
+
+        engine = Sam3Engine(
+            self.bpe_path,
+            checkpoint_path=self.checkpoint,
+            confidence_threshold=self.min_score,
+        )
+        engine.build()
+        self.engine = engine
+
     def infer(self, sample: CaptureSample) -> tuple[Candidate, ...]:
         """Run one text detection and validate its geometry against the raw image.
 
@@ -85,12 +101,8 @@ class Sam3CapturePredictor:
         try:
             if digest_file(sample.image_path) != sample.sha256:
                 raise CaptureError("Image changed after the capture snapshot")
-            if self.engine is None:
-                # Review and cached reassignment must not initialize the GPU runtime.
-                from sam3_pipeline.engine import Sam3Engine  # noqa: PLC0415
-
-                self.engine = Sam3Engine(self.bpe_path, checkpoint_path=self.checkpoint, confidence_threshold=self.min_score)
-                self.engine.build()
+            self.initialize()
+            assert self.engine is not None
             with Image.open(sample.image_path) as raw:
                 image = raw.convert("RGB")
             if image.size != (sample.width, sample.height):

@@ -149,3 +149,5 @@ secrets.json
 
 *.npy
 *.npz
+
+!src/configs/capture.json

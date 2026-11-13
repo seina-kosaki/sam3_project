@@ -237,7 +237,7 @@ class SqliteObjectReviewStore:
             annotation: YOLO用の編集可能注釈。
             status: 画像の確認・承認・取消・公開状態。
             approval: 明示承認の記録。承認以外はNoneである。
-            decisions: 全物体の確定採否。画像承認と同じトランザクションで保存する。
+            decisions: 今回確定する物体の採否。画像承認と同じトランザクションで保存する。
             sample: 一括確定時の撮影SQL・原本照合に用いる画像。
             overwrite_masks: 既存承認用maskの上書きに利用者が同意したか。
             assignments: DINO候補ごとの手動対応。採否・承認と同時に確定する。
@@ -250,7 +250,7 @@ class SqliteObjectReviewStore:
         candidates: tuple[Candidate, ...] = ()
         write_masks = False
         if assignments is not None and decisions is None:
-            raise CaptureError("手動対応には全物体の採否が必要である")
+            raise CaptureError("手動対応には物体の採否が必要である")
         if decisions is not None and (sample is None or status != "approved" or approval is None or not str(approval.get("reviewer", "")).strip()):
             raise CaptureError("物体判定の一括保存には画像と担当者の承認が必要である")
         if sample is not None and status == "approved":
@@ -285,18 +285,45 @@ class SqliteObjectReviewStore:
                     raise CaptureError("DINO確認担当者を入力してください")
                 self._current(connection, sample, revision)
                 objects = connection.execute("SELECT * FROM sam3_object_reviews WHERE revision=?", (revision,)).fetchall()
-                if set(decisions) != {item["object_index"] for item in objects}:
-                    raise CaptureError("画像内の全物体を判定してください")
-                if assignments is not None and set(assignments) != set(decisions):
-                    raise CaptureError("画像内の全候補のタグ対応を指定してください")
+                object_indices = {item["object_index"] for item in objects}
+                if not decisions or not set(decisions).issubset(object_indices):
+                    raise CaptureError("保存対象の候補を指定してください")
+                if assignments is not None and not set(assignments).issubset(set(decisions)):
+                    raise CaptureError("タグ対応は採否を指定した候補だけに指定してください")
                 allowed = {(tag.instrument_uid, tag.instance_no) for tag in sample.tags if tag.visible}
+                decisions = dict(decisions)
+                accepted_by_tag: dict[tuple[str, int], int] = {}
+                for item in objects:
+                    index = item["object_index"]
+                    if decisions.get(index) != "accepted":
+                        continue
+                    identity = (item["instrument_uid"], item["instance_no"]) if item["instrument_uid"] is not None and item["instance_no"] is not None else None
+                    if assignments is not None and index in assignments:
+                        identity = assignments[index]
+                    if identity is None:
+                        raise CaptureError("器具未確定の物体はDINOに使えない")
+                    if identity not in allowed:
+                        raise CaptureError("現在の可視タグにない器具対応である")
+                    if identity in accepted_by_tag:
+                        raise CaptureError("一つのタグに複数のDINO候補は採用できない")
+                    accepted_by_tag[identity] = index
+                for item in objects:
+                    index = item["object_index"]
+                    if index in decisions or item["dino_status"] == "rejected":
+                        continue
+                    identity = (item["instrument_uid"], item["instance_no"]) if item["instrument_uid"] is not None and item["instance_no"] is not None else None
+                    if identity in accepted_by_tag:
+                        decisions[index] = "rejected"
                 accepted: set[tuple[str, int]] = set()
                 for item in objects:
-                    decision = decisions[item["object_index"]]
-                    identity = assignments[item["object_index"]] if assignments is not None else ((item["instrument_uid"], item["instance_no"]) if item["instrument_uid"] is not None and item["instance_no"] is not None else None)
-                    if decision not in {"accepted", "rejected"}:
-                        raise CaptureError("未判定の物体がある。「使う／使わない」を選択してください")
-                    if identity is not None and identity not in allowed:
+                    index = item["object_index"]
+                    decision = decisions.get(index, item["dino_status"])
+                    identity = (item["instrument_uid"], item["instance_no"]) if item["instrument_uid"] is not None and item["instance_no"] is not None else None
+                    if assignments is not None and index in assignments:
+                        identity = assignments[index]
+                    if index in decisions and decision not in {"accepted", "rejected"}:
+                        raise CaptureError("保存対象の候補は「使う／使わない」を選択してください")
+                    if identity is not None and identity not in allowed and (index in decisions or decision == "accepted"):
                         raise CaptureError("現在の可視タグにない器具対応である")
                     if decision == "accepted" and identity is None:
                         raise CaptureError("器具未確定の物体はDINOに使えない")
@@ -304,10 +331,15 @@ class SqliteObjectReviewStore:
                         if identity in accepted:
                             raise CaptureError("一つのタグに複数のDINO候補は採用できない")
                         accepted.add(identity)
+                if not accepted:
+                    raise CaptureError("採用されたmaskがないため、DINO保存対象がありません")
                 # 対応だけが先に残らないよう、検証後に採否・承認・maskと同じトランザクションへ記録する。
                 if assignments is not None:
                     for item in objects:
-                        identity = assignments[item["object_index"]]
+                        index = item["object_index"]
+                        if index not in assignments:
+                            continue
+                        identity = assignments[index]
                         uid, instance = identity if identity is not None else (None, None)
                         if (uid, instance) != (item["instrument_uid"], item["instance_no"]):
                             connection.execute(
@@ -563,13 +595,74 @@ class SqliteObjectReviewStore:
         """
         with self._connection(revision=revision) as connection:
             row = connection.execute("SELECT status, approval_id, approval_json FROM sam3_review_revisions WHERE revision=? AND is_current=1", (revision,)).fetchone()
+            approval_scope = json.loads(row["approval_json"] or "{}").get("scope") if row is not None else None
             return (
                 row is not None
                 and row["status"] in APPROVED_STATUSES
                 and row["approval_id"] is not None
                 and (approval_id is None or row["approval_id"] == approval_id)
-                and (scope != "yolo" or json.loads(row["approval_json"] or "{}").get("scope") != "dino")
+                and (scope != "yolo" or approval_scope != "dino")
+                and (scope != "dino" or approval_scope == "dino")
             )
+
+    def object_review_state(self, revision: str) -> str:
+        """DINO物体の判定進捗をYOLO承認と独立して返す。"""
+        with self._connection(revision=revision) as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) AS total,
+                SUM(CASE WHEN dino_status != 'pending' THEN 1 ELSE 0 END) AS decided
+                FROM sam3_object_reviews WHERE revision=?""",
+                (revision,),
+            ).fetchone()
+        total = row["total"]
+        decided = row["decided"] or 0
+        if total == 0 or decided == 0:
+            return "未確認"
+        if decided < total:
+            return "判定途中"
+        return "判定済み"
+
+    def catalog_state(self, session_id: str, image_id: str, revision: str) -> dict[str, Any] | None:
+        """選択一覧用に、指定セッション内の登録済みレビュー状態だけを返す。"""
+        database = session_database(self.database_path, session_id)
+        store = SqliteObjectReviewStore(database, self.timeout, self.predictions)
+        with store._connection(refresh=False) as connection:
+            has_review_schema = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sam3_review_revisions'"
+            ).fetchone()
+            if has_review_schema is None:
+                return None
+            row = connection.execute(
+                """SELECT status, approval_id, approval_json, progress_json, is_current
+                FROM sam3_review_revisions WHERE revision=? AND session_id=? AND image_id=?""",
+                (revision, session_id, image_id),
+            ).fetchone()
+            if row is None:
+                return None
+            approval_scope = json.loads(row["approval_json"] or "{}").get("scope")
+            is_approved = row["is_current"] == 1 and row["status"] in APPROVED_STATUSES and row["approval_id"] is not None
+            object_counts = connection.execute(
+                """SELECT COUNT(*) AS total,
+                SUM(CASE WHEN dino_status != 'pending' THEN 1 ELSE 0 END) AS decided,
+                SUM(CASE WHEN dino_status = 'accepted' THEN 1 ELSE 0 END) AS accepted
+                FROM sam3_object_reviews WHERE revision=?""",
+                (revision,),
+            ).fetchone()
+        total = object_counts["total"]
+        decided = object_counts["decided"] or 0
+        accepted = object_counts["accepted"] or 0
+        if total == 0 or decided == 0:
+            dino_state = "未確認"
+        elif decided < total:
+            dino_state = "判定途中"
+        else:
+            dino_state = "判定済み"
+        return {
+            "progress": json.loads(row["progress_json"]),
+            "yolo_approved": is_approved and approval_scope != "dino",
+            "dino_approved": is_approved and (approval_scope == "dino" or accepted > 0),
+            "dino_state": dino_state,
+        }
 
     @staticmethod
     def _json(value: Any) -> str:

@@ -66,10 +66,12 @@ class BatchReviewServer:
         self.thresholds = thresholds
         self.samples = {(sample.session_id, sample.image_id): sample for sample in samples}
         self._progress_lock = threading.Lock()
+        self.selection_return_url: str | None = None
 
-    def serve(self) -> None:
-        """Start the local review server and open its page in the default browser."""
+    def serve(self, selection_return_url: str | None = None, stop_event: threading.Event | None = None) -> None:
+        """Start the review UI, optionally returning to a live selection server."""
         handler = self._handler_type()
+        self.selection_return_url = selection_return_url
         with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
             address = server.server_address[0]
             port = server.server_address[1]
@@ -79,9 +81,22 @@ class BatchReviewServer:
             LOGGER.info("Batch review: %s (Ctrl+C to stop)", url)
             webbrowser.open(url)
             try:
-                server.serve_forever()
+                if stop_event is None:
+                    server.serve_forever()
+                else:
+                    server.timeout = 0.2
+                    while not stop_event.is_set():
+                        server.handle_request()
             except KeyboardInterrupt:
                 LOGGER.info("Batch review stopped")
+
+    def _review_page(self) -> bytes:
+        """必要な場合だけ既存画面にselection serverの戻り先を設定する。"""
+        page = HTML_FILE.read_text(encoding="utf-8")
+        if self.selection_return_url is not None:
+            return_url = json.dumps(self.selection_return_url)
+            page = page.replace("</head>", f"<script>window.selectionReturnUrl = {return_url};</script></head>", 1)
+        return page.encode("utf-8")
 
     def _handler_type(self) -> type[BaseHTTPRequestHandler]:
         """Bind request methods to this store without global mutable state."""
@@ -103,7 +118,7 @@ class BatchReviewServer:
         """UI、現行レビュー一覧、またはSQL上の原本画像を返す。"""
         route = urlsplit(request.path).path
         if route == "/":
-            self._respond(request, HTML_FILE.read_bytes(), "text/html; charset=utf-8")
+            self._respond(request, self._review_page(), "text/html; charset=utf-8")
             return
         if route == "/tag_review.js":
             self._respond(request, TAG_REVIEW_FILE.read_bytes(), "text/javascript; charset=utf-8")
@@ -205,9 +220,11 @@ class BatchReviewServer:
             objects: list[dict[str, Any]] = []
             dino_approved = approved
             if self.store.review_store is not None:
-                dino_approved = self.store.review_store.approved(revision)
+                dino_image_approved = self.store.review_store.approved(revision, scope="dino")
                 approved = self.store.review_store.approved(revision, scope="yolo")
                 objects = self.store.review_store.objects(sample, revision)
+                has_accepted_object = any(item["dino_status"] == "accepted" for item in objects)
+                dino_approved = dino_image_approved or (approved and has_accepted_object)
                 for item in objects:
                     item["mask_url"] = f"/api/mask/{revision}/{item['object_index']}"
             items.append(
@@ -265,13 +282,13 @@ class BatchReviewServer:
         self.store.approve(revision, payload["reviewer"], confirm_complete=True, allow_empty=payload.get("allow_empty") is True, exception_note=str(payload.get("exception_note", "")))
 
     def _complete_review(self, payload: dict[str, Any]) -> None:
-        """全物体の確定判定と画像承認を一回の操作で保存する。
+        """選択した物体の確定判定と画像承認を一回の操作で保存する。
 
         Args:
-            payload: 画像版、共通担当者、全物体の採否と明示確認。
+            payload: 画像版、共通担当者、確定する物体の採否と明示確認。
 
         Raises:
-            CaptureError: 担当者、全件判定、現行性、原本または注釈が不正な場合。
+            CaptureError: 担当者、採否、現行性、原本または注釈が不正な場合。
         """
         revision, _ = self._current_object_revision(str(payload.get("revision", "")))
         reviewer = payload.get("reviewer")
@@ -281,7 +298,7 @@ class BatchReviewServer:
             raise CaptureError("画像全体を確認してから保存してください")
         records = payload.get("decisions")
         if not isinstance(records, list):
-            raise CaptureError("画像内の全物体を判定してください")
+            raise CaptureError("保存対象の候補を指定してください")
         # 重複番号や真偽値を辞書化で見落とさず、保存前に拒否する。
         decisions: dict[int, str] = {}
         for record in records:
@@ -289,14 +306,14 @@ class BatchReviewServer:
                 raise CaptureError("物体判定の形式が不正である")
             index, status = record.get("object_index"), record.get("status")
             if isinstance(index, bool) or not isinstance(index, int) or index in decisions or status not in ("accepted", "rejected"):
-                raise CaptureError("全物体の「使う／使わない」を重複なく選択してください")
+                raise CaptureError("保存対象の「使う／使わない」を重複なく指定してください")
             decisions[index] = status
         assignments: dict[int, tuple[str, int] | None] | None = None
         if "assignments" in payload:
             assignments = {}
             raw_assignments = payload["assignments"]
             if not isinstance(raw_assignments, list):
-                raise CaptureError("全候補のタグ対応を指定してください")
+                raise CaptureError("今回確定する候補のタグ対応を配列で指定してください")
             for record in raw_assignments:
                 if not isinstance(record, dict):
                     raise CaptureError("タグ対応の形式が不正である")
@@ -444,12 +461,15 @@ class BatchReviewServer:
             allowed = {entry[0] for entry in source["instruments"]}
             allowed.update(tag["instrument_uid"] for tag in source["tags"])
             state = self._progress_state(progress.get(revision))
-            shapes = validate_rectangles(annotation, allowed, source["width"], source["height"], allow_empty=state["allow_empty"])
+            try:
+                shapes = validate_rectangles(annotation, allowed, source["width"], source["height"], allow_empty=state["allow_empty"])
+            except CaptureError as error:
+                raise CaptureError(f"image ID {source['image_id']}: {error}") from error
             expected = Counter(tag["instrument_uid"] for tag in source["tags"] if tag["visible"])
             actual = Counter(shape["label"] for shape in shapes)
             note = state["exception_note"]
             if expected != actual and not note.strip():
-                raise CaptureError(f"{revision}: tag and rectangle counts differ; enter an exception note")
+                raise CaptureError(f"image ID {source['image_id']}: tag and rectangle counts differ; enter an exception note")
             approved_items.append((revision, note, state["allow_empty"]))
 
         for revision, note, empty_ok in approved_items:

@@ -149,6 +149,9 @@ def test_capture_source_without_session_databases_rejects_input(tmp_path: Path, 
         list(source.iter_samples())
 
 
+
+
+
 def test_capture_source_untagged_session_is_excluded(tmp_path: Path) -> None:
     """未タグ画像だけを含むセッションは推論対象にしない。"""
     first = _bundle(tmp_path)
@@ -972,11 +975,124 @@ def test_review_draft_does_not_copy_capture_image(tmp_path: Path) -> None:
     assert read_json(store.root / REVIEWS_DIR / revision / ANNOTATION_FILE)["imagePath"] == sample.source_path
 
 
+def test_initial_draft_publishes_matched_boxes_and_preserves_unresolved_candidates(tmp_path: Path) -> None:
+    """公開可能な対応済みbboxと未解決候補を初期保存から分離する。"""
+    store, _, sample = _draft(tmp_path)
+    candidates = (_candidate(0, 10, 30), _candidate(1, 70, 90))
+    result = MatchResult((Assignment(0, "a", 1),), ("unmatched_candidate:1",))
+
+    revision = store.save_draft(sample, candidates, result, "multiple-candidate-prediction", "multiple-candidate-matching")
+    annotation = read_json(store.root / REVIEWS_DIR / revision / ANNOTATION_FILE)
+
+    assert annotation["tag_review_version"] == 1
+    assert len(annotation["shapes"]) == 1
+    assert annotation["shapes"][0]["label"] == "a"
+    assert annotation["shapes"][0]["tag_assignment"] == {"instrument_uid": "a", "instance_no": 1}
+    assert annotation["shapes"][0]["points"] == [[10.0, 10.0], [30.0, 90.0]]
+    assert annotation["shapes"][0]["group_id"] == 0
+    assert json.loads(annotation["shapes"][0]["description"]) == {"score": 0.9, "instance_no": 1}
+    assert len(annotation["review_candidates"]) == 1
+    unresolved = annotation["review_candidates"][0]
+    assert unresolved["label"] == "__unresolved__"
+    assert unresolved["tag_assignment"] is None
+    assert unresolved["points"] == [[70.0, 10.0], [90.0, 90.0]]
+    assert unresolved["group_id"] == 1
+    assert json.loads(unresolved["description"]) == {"score": 0.9, "instance_no": None}
+
+    server = BatchReviewServer(store, ConfidenceThresholds(0.65, 0.85), (sample,))
+    server._set_reviewed({"revision": revision, "reviewed": True})
+    manifest = server._publish({"reviewer": "operator", "confirm_complete": True, "session_id": sample.session_id})
+    record = read_json(manifest)["samples"][0]
+    published_annotation = read_json(manifest.parent / record["annotation"])
+
+    assert len(published_annotation["shapes"]) == 1
+    assert published_annotation["shapes"][0]["label"] == "a"
+    assert published_annotation["review_candidates"] == annotation["review_candidates"]
+
+
+def test_save_draft_migrates_only_unmodified_legacy_initial_annotation(tmp_path: Path) -> None:
+    """再実行時、初期生成物と完全一致する旧草案だけを自動移行する。"""
+    store, revision, sample = _draft(tmp_path)
+    annotation_path = store.root / REVIEWS_DIR / revision / ANNOTATION_FILE
+    annotation = read_json(annotation_path)
+    annotation["shapes"].extend(annotation.pop("review_candidates"))
+    annotation.pop("tag_review_version")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
+    atomic_json(annotation_path, annotation)
+    metadata = read_json(store.root / "drafts" / revision / "metadata.json")
+    candidates = (_candidate(0, 10, 30),)
+    result = ScipyInstanceMatcher(MatchSettings(0.03, 0.05)).match(sample, candidates)
+
+    returned_revision = store.save_draft(
+        sample,
+        candidates,
+        result,
+        metadata["prediction_key"],
+        metadata["matching_signature"],
+    )
+
+    migrated = read_json(annotation_path)
+    assert returned_revision == revision
+    assert migrated["tag_review_version"] == 1
+    assert len(migrated["shapes"]) == 1
+    assert migrated["shapes"][0]["tag_assignment"] == {"instrument_uid": "a", "instance_no": 1}
+
+
+def test_save_draft_does_not_migrate_edited_legacy_annotation(tmp_path: Path) -> None:
+    """bboxが一箇所でも編集されていたら旧形式の内容を変更しない。"""
+    store, revision, sample = _draft(tmp_path)
+    annotation_path = store.root / REVIEWS_DIR / revision / ANNOTATION_FILE
+    annotation = read_json(annotation_path)
+    annotation["shapes"].extend(annotation.pop("review_candidates"))
+    annotation.pop("tag_review_version")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
+    annotation["shapes"][0]["points"][0][0] = CORRECTED_LEFT
+    atomic_json(annotation_path, annotation)
+    metadata = read_json(store.root / "drafts" / revision / "metadata.json")
+    candidates = (_candidate(0, 10, 30),)
+    result = ScipyInstanceMatcher(MatchSettings(0.03, 0.05)).match(sample, candidates)
+
+    store.save_draft(sample, candidates, result, metadata["prediction_key"], metadata["matching_signature"])
+
+    saved = read_json(annotation_path)
+    assert "tag_review_version" not in saved
+    assert saved["shapes"][0]["points"][0][0] == CORRECTED_LEFT
+
+
+def test_save_draft_does_not_migrate_reviewed_legacy_annotation(tmp_path: Path) -> None:
+    """内容が初期値と一致しても確認済みなら自動移行を見送る。"""
+    store, revision, sample = _draft(tmp_path)
+    annotation_path = store.root / REVIEWS_DIR / revision / ANNOTATION_FILE
+    annotation = read_json(annotation_path)
+    annotation["shapes"].extend(annotation.pop("review_candidates"))
+    annotation.pop("tag_review_version")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
+    atomic_json(annotation_path, annotation)
+    atomic_json(store.root / "review_progress.json", {revision: {"reviewed": True}})
+    metadata = read_json(store.root / "drafts" / revision / "metadata.json")
+    candidates = (_candidate(0, 10, 30),)
+    result = ScipyInstanceMatcher(MatchSettings(0.03, 0.05)).match(sample, candidates)
+
+    store.save_draft(sample, candidates, result, metadata["prediction_key"], metadata["matching_signature"])
+
+    saved = read_json(annotation_path)
+    assert "tag_review_version" not in saved
+    assert saved["shapes"] == annotation["shapes"]
+
+
 def test_batch_review_save_allows_unresolved_draft_label(tmp_path: Path) -> None:
     """Keep a partial review editable while final approval remains strict."""
     store, revision, _ = _draft(tmp_path)
     annotation = read_json(store.root / REVIEWS_DIR / revision / ANNOTATION_FILE)
+    annotation.pop("tag_review_version")
+    annotation.pop("review_candidates")
+    for shape in annotation["shapes"]:
+        shape.pop("tag_assignment")
     annotation["shapes"][0]["label"] = "__unresolved__"
+    atomic_json(store.root / REVIEWS_DIR / revision / ANNOTATION_FILE, annotation)
     review_server = BatchReviewServer(store, ConfidenceThresholds(0.65, 0.85), tuple(store.capture_source.iter_samples()))
 
     review_server._save_annotation({"revision": revision, "annotation": annotation})
@@ -1036,7 +1152,7 @@ def test_approve_unresolved_label_rejects_input(tmp_path: Path) -> None:
     data["shapes"][0]["label"] = "__unresolved__"
     atomic_json(path, data)
 
-    with pytest.raises(CaptureError, match="Resolve all shapes"):
+    with pytest.raises(CaptureError, match="unresolved"):
         store.approve(revision, "reviewer", confirm_complete=True)
 
 
@@ -1175,7 +1291,7 @@ def test_approve_nonrectangle_shape_rejects_conversion(tmp_path: Path, shape_typ
     data["shapes"][0]["shape_type"] = shape_type
     atomic_json(path, data)
 
-    with pytest.raises(CaptureError, match="rectangles"):
+    with pytest.raises(CaptureError, match="shape_type"):
         store.approve(revision, "reviewer", confirm_complete=True)
 
 

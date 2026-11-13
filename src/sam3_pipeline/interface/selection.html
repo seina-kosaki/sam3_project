@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAM3 推論対象を選択</title>
+  <style>
+    body { margin: 0; color: #172b29; background: #f2f4ef; font-family: "Yu Gothic UI", sans-serif; }
+    main { max-width: 1280px; margin: auto; padding: 22px; }
+    header, .toolbar, .pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    header { padding: 14px 22px; color: white; background: #172b29; }
+    h1 { margin: 0; font-size: 24px; }
+    .toolbar { flex-wrap: wrap; margin: 18px 0; }
+    select, button { min-height: 36px; padding: 5px 10px; }
+    button { cursor: pointer; }
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+    article { overflow: hidden; border: 1px solid #d7dfd8; border-radius: 5px; background: white; }
+    article label { display: flex; align-items: flex-start; gap: 8px; padding: 8px; }
+    img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain; background: #e6eae5; }
+    small { display: block; color: #647572; margin-top: 4px; }
+    .error { color: #a43f36; }
+    .pager { justify-content: center; margin: 16px; }
+    #notice { min-height: 24px; color: #a43f36; }
+    @media (max-width: 600px) { main { padding: 12px; } header, .toolbar { align-items: flex-start; flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <header><strong>SAM3 / CAPTURE DATA</strong><span>推論前の対象選択</span></header>
+  <main>
+    <h1>推論する画像を選択</h1>
+    <p>処理済み画像も選択できます。YOLOとDINOの状態は別々に表示されます。</p>
+    <div class="toolbar">
+      <label>日付 <select id="date"></select></label>
+      <label>セッション <select id="session"></select></label>
+      <span id="count"></span>
+      <button id="page-select" type="button">このページを選択</button>
+      <button id="page-clear" type="button">このページの選択解除</button>
+      <button id="submit" type="button">選択した画像を推論</button>
+    </div>
+    <div id="notice" role="status"></div>
+    <section id="grid"></section>
+    <nav class="pager">
+      <button id="previous" type="button">前へ</button><span id="page"></span><button id="next" type="button">次へ</button>
+    </nav>
+  </main>
+  <script>
+    const pageSize = 50;
+    let items = [];
+    let selected = new Set();
+    let currentPage = 0;
+    const date = document.querySelector("#date");
+    const session = document.querySelector("#session");
+    const grid = document.querySelector("#grid");
+    const notice = document.querySelector("#notice");
+    const identity = item => `${item.session_id}\u0000${item.image_id}`;
+    function setOptions(select, values) {
+      select.innerHTML = "";
+      for (const value of values) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        select.append(option);
+      }
+      select.disabled = values.length === 0;
+      select.value = values.length ? values[0] : "";
+    }
+    function visibleSessionItems() {
+      return items.filter(item => item.capture_date === date.value && item.session_id === session.value);
+    }
+    function updateSessionOptions() {
+      const previousSession = session.value;
+      const sessionValues = items
+        .filter(item => item.capture_date === date.value)
+        .map(item => item.session_id)
+        .filter((value, index, values) => values.indexOf(value) === index)
+        .sort();
+      setOptions(session, sessionValues);
+      if (sessionValues.includes(previousSession)) session.value = previousSession;
+    }
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[character]));
+    }
+    function render() {
+      const sessionItems = visibleSessionItems();
+      const pageCount = Math.max(1, Math.ceil(sessionItems.length / pageSize));
+      currentPage = Math.min(currentPage, pageCount - 1);
+      const pageItems = sessionItems.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+      grid.innerHTML = pageItems.length ? pageItems.map(item => `<article>
+        <img alt="${escapeHtml(item.image_id)}" src="/api/image?session_id=${encodeURIComponent(item.session_id)}&image_id=${encodeURIComponent(item.image_id)}">
+        <label><input type="checkbox" data-id="${encodeURIComponent(identity(item))}" ${selected.has(identity(item)) ? "checked" : ""}>
+          <span>${escapeHtml(item.image_id)}<small>${escapeHtml(item.capture_date)} / ${item.width} × ${item.height}</small>
+          <small>${item.draft ? "既存草案あり" : "未推論"} · YOLO: ${escapeHtml(item.yolo)} · DINO: ${escapeHtml(item.dino)}</small></span></label>
+        </article>`).join("") : "<p>選択できる画像がありません。</p>";
+      for (const image of grid.querySelectorAll("img")) image.onerror = () => {
+        image.alt = "画像を表示できません";
+        image.classList.add("error");
+        const checkbox = image.parentElement.querySelector("input");
+        selected.delete(decodeURIComponent(checkbox.dataset.id));
+        checkbox.checked = false;
+        checkbox.disabled = true;
+        updateCount();
+        notice.textContent = "画像の表示に失敗した項目があります。選択前に撮影ファイルを確認してください。";
+      };
+      for (const checkbox of grid.querySelectorAll("input")) checkbox.onchange = () => {
+        const key = decodeURIComponent(checkbox.dataset.id);
+        if (checkbox.checked) selected.add(key);
+        else selected.delete(key);
+        updateCount();
+      };
+      document.querySelector("#page").textContent = `${currentPage + 1} / ${pageCount} ページ`;
+      document.querySelector("#previous").disabled = currentPage === 0;
+      document.querySelector("#next").disabled = currentPage + 1 >= pageCount;
+      updateCount();
+    }
+    function updateCount() {
+      document.querySelector("#count").textContent = `選択 ${selected.size} 件`;
+    }
+    document.querySelector("#previous").onclick = () => { currentPage--; render(); };
+    document.querySelector("#next").onclick = () => { currentPage++; render(); };
+    document.querySelector("#page-select").onclick = () => {
+      for (const item of visibleSessionItems().slice(currentPage * pageSize, (currentPage + 1) * pageSize)) selected.add(identity(item));
+      render();
+    };
+    document.querySelector("#page-clear").onclick = () => {
+      for (const item of visibleSessionItems().slice(currentPage * pageSize, (currentPage + 1) * pageSize)) selected.delete(identity(item));
+      render();
+    };
+    date.onchange = () => {
+      currentPage = 0;
+      updateSessionOptions();
+      render();
+    };
+    session.onchange = () => { currentPage = 0; render(); };
+    document.querySelector("#submit").onclick = async () => {
+      const chosen = items.filter(item => selected.has(identity(item))).map(item => ({session_id: item.session_id, image_id: item.image_id}));
+      try {
+        const response = await fetch("/api/select", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({selected: chosen})});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        notice.textContent = `${result.count} 件を選択しました。推論を開始します。`;
+        document.querySelector("#submit").disabled = true;
+      } catch (error) {
+        notice.textContent = `選択を送信できません: ${error.message}`;
+      }
+    };
+    fetch("/api/catalog").then(response => response.json()).then(data => {
+      if (!data.items) throw new Error(data.error || "一覧を取得できません");
+      items = data.items;
+      const dateValues = items
+        .map(item => item.capture_date)
+        .filter((value, index, values) => values.indexOf(value) === index)
+        .sort();
+      setOptions(date, dateValues);
+      updateSessionOptions();
+      render();
+    }).catch(error => { notice.textContent = `対象一覧を取得できません: ${error.message}`; });
+  </script>
+</body>
+</html>

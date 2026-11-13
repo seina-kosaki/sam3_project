@@ -23,7 +23,7 @@ from PIL import Image
 from sam3_pipeline.domain.annotation import RECTANGLE, UNRESOLVED_LABEL, Candidate, MatchResult, ObjectReviewStore, PredictionStore
 from sam3_pipeline.domain.capture import SCHEMA_VERSION, AnnotationLedger, CaptureError, CaptureSample, CaptureSource
 from sam3_pipeline.infrastructure.matching import ArrayMask
-from sam3_pipeline.infrastructure.tag_annotations import validate_tag_review
+from sam3_pipeline.infrastructure.tag_annotations import TAG_REVIEW_VERSION, validate_tag_review
 
 CACHE_DIR = "cache"
 DRAFTS_DIR = "drafts"
@@ -120,27 +120,48 @@ def validate_rectangles(data: dict[str, Any], allowed_uids: set[str], width: int
         raise CaptureError("Empty annotations require explicit true-negative approval")
     groups: set[int] = set()
     boxes: set[str] = set()
-    for shape in shapes:
+    for shape_index, shape in enumerate(shapes):
+        if not isinstance(shape, dict):
+            raise CaptureError(f"shape index {shape_index} field 'shape' must be an object")
         label = shape.get("label")
-        unresolved = label == UNRESOLVED_LABEL
-        if (unresolved and not allow_unresolved) or (not unresolved and label not in allowed_uids) or shape.get("shape_type") != RECTANGLE:
-            raise CaptureError("Resolve all shapes to declared instrument UIDs and rectangles")
+        is_unresolved = label == UNRESOLVED_LABEL
+        if is_unresolved and not allow_unresolved:
+            raise CaptureError(f"shape index {shape_index} field 'label' is unresolved")
+        if not is_unresolved and (not isinstance(label, str) or label not in allowed_uids):
+            raise CaptureError(f"shape index {shape_index} field 'label' must be a declared instrument UID")
+        shape_type = shape.get("shape_type")
+        if shape_type != RECTANGLE:
+            raise CaptureError(f"shape index {shape_index} field 'shape_type' must be '{RECTANGLE}'")
         points = shape.get("points", [])
-        if len(points) != BOX_POINT_COUNT or any(len(point) != POINT_COORDINATE_COUNT for point in points):
-            raise CaptureError("A rectangle requires exactly two opposite corners")
-        if not all(isinstance(value, (float, int)) and math.isfinite(value) for point in points for value in point):
-            raise CaptureError("Nonfinite rectangle coordinate")
+        has_two_corners = isinstance(points, list) and len(points) == BOX_POINT_COUNT
+        has_valid_corner_lengths = has_two_corners and all(
+            isinstance(point, list) and len(point) == POINT_COORDINATE_COUNT
+            for point in points
+        )
+        if not has_valid_corner_lengths:
+            raise CaptureError(f"shape index {shape_index} field 'points' must contain exactly two corners")
+        has_finite_coordinates = all(
+            isinstance(value, (float, int)) and math.isfinite(value)
+            for point in points
+            for value in point
+        )
+        if not has_finite_coordinates:
+            raise CaptureError(f"shape index {shape_index} field 'points' must contain finite coordinates")
         (first_x, first_y), (second_x, second_y) = points
-        if not (0 <= min(first_x, second_x) < max(first_x, second_x) <= width and 0 <= min(first_y, second_y) < max(first_y, second_y) <= height):
-            raise CaptureError("Rectangle must have positive area inside the original image")
+        is_inside_image = (
+            0 <= min(first_x, second_x) < max(first_x, second_x) <= width
+            and 0 <= min(first_y, second_y) < max(first_y, second_y) <= height
+        )
+        if not is_inside_image:
+            raise CaptureError(f"shape index {shape_index} field 'points' must define positive area inside the image")
         group = shape.get("group_id")
         if group is not None:
             if not isinstance(group, int) or group in groups:
-                raise CaptureError("Duplicate or invalid instance group_id")
+                raise CaptureError(f"shape index {shape_index} field 'group_id' is duplicated or invalid")
             groups.add(group)
         box = content_hash([label, min(first_x, second_x), min(first_y, second_y), max(first_x, second_x), max(first_y, second_y)])
         if box in boxes:
-            raise CaptureError("Duplicate annotation rectangle")
+            raise CaptureError(f"shape index {shape_index} duplicates an annotation rectangle")
         boxes.add(box)
     return shapes
 
@@ -254,7 +275,7 @@ class FileAnnotationStore:
             matching_signature: Matching configuration fingerprint.
 
         Returns:
-            Stable revision ID; existing workspaces are never rewritten.
+            Stable revision ID; existing edits are preserved and only an exact initial legacy draft may migrate.
 
         Raises:
             CaptureError: Source image contents or dimensions have changed.
@@ -267,9 +288,25 @@ class FileAnnotationStore:
         if (draft_dir / METADATA_FILE).exists():
             if not (review_dir / ANNOTATION_FILE).exists():
                 raise CaptureError(f"Review workspace is missing: {revision}")
+            annotation_path = review_dir / ANNOTATION_FILE
+            annotation = read_json(annotation_path)
+            was_migrated = False
+            if "tag_review_version" not in annotation:
+                local_progress_path = self.root / "review_progress.json"
+                local_progress = read_json(local_progress_path) if local_progress_path.exists() else {}
+                persisted_progress = self.review_store.progress() if self.review_store is not None else {}
+                if self._can_migrate_initial_annotation(revision, sample, local_progress.get(revision), persisted_progress):
+                    candidate_records = [{"index": candidate.index, "box": candidate.box, "score": candidate.score} for candidate in candidates]
+                    upgraded = self._upgrade_initial_annotation(sample, annotation, metadata, candidate_records)
+                    if upgraded is not None:
+                        atomic_json(annotation_path, upgraded)
+                        annotation = upgraded
+                        was_migrated = True
             self._mark_latest(sample, revision)
             if self.review_store is not None:
-                self.review_store.sync_revision(sample, revision, metadata, read_json(review_dir / ANNOTATION_FILE))
+                self.review_store.sync_revision(sample, revision, metadata, annotation)
+            if was_migrated:
+                self._record_annotation(source, revision, "inferred", annotation_path)
             return revision
         if not sample.source_path or digest_file(sample.image_path) != sample.sha256:
             raise CaptureError("Source image changed while processing")
@@ -278,21 +315,35 @@ class FileAnnotationStore:
                 raise CaptureError("Source image dimensions differ from capture metadata")
         review_dir.mkdir(parents=True, exist_ok=False)
         assignments = {assignment.candidate_index: assignment for assignment in result.assignments}
-        shapes = []
+        shapes: list[dict[str, Any]] = []
+        review_candidates: list[dict[str, Any]] = []
         for candidate in candidates:
             assignment = assignments.get(candidate.index)
             xmin, ymin, xmax, ymax = candidate.box
-            shapes.append(
-                {
-                    "label": assignment.instrument_uid if assignment else UNRESOLVED_LABEL,
-                    "points": [[xmin, ymin], [xmax, ymax]],
-                    "group_id": candidate.index,
-                    "shape_type": RECTANGLE,
-                    "flags": {"needs_review": True},
-                    "description": json.dumps({"score": candidate.score, "instance_no": assignment.instance_no if assignment else None}),
-                }
-            )
-        labelme = {"version": LABELME_VERSION, "flags": {"needs_review": True}, "shapes": shapes, "imagePath": sample.source_path, "imageData": None, "imageWidth": sample.width, "imageHeight": sample.height}
+            shape = {
+                "label": assignment.instrument_uid if assignment else UNRESOLVED_LABEL,
+                "points": [[xmin, ymin], [xmax, ymax]],
+                "group_id": candidate.index,
+                "shape_type": RECTANGLE,
+                "flags": {"needs_review": True},
+                "description": json.dumps({"score": candidate.score, "instance_no": assignment.instance_no if assignment else None}),
+                "tag_assignment": {"instrument_uid": assignment.instrument_uid, "instance_no": assignment.instance_no} if assignment else None,
+            }
+            if assignment:
+                shapes.append(shape)
+            else:
+                review_candidates.append(shape)
+        labelme = {
+            "version": LABELME_VERSION,
+            "flags": {"needs_review": True},
+            "tag_review_version": TAG_REVIEW_VERSION,
+            "shapes": shapes,
+            "review_candidates": review_candidates,
+            "imagePath": sample.source_path,
+            "imageData": None,
+            "imageWidth": sample.width,
+            "imageHeight": sample.height,
+        }
         atomic_json(review_dir / ANNOTATION_FILE, labelme)
         atomic_json(draft_dir / METADATA_FILE, metadata)
         self._mark_latest(sample, revision)
@@ -301,8 +352,8 @@ class FileAnnotationStore:
         self._record_annotation(source, revision, "inferred", review_dir / ANNOTATION_FILE)
         return revision
 
-    def sync_object_reviews(self) -> int:
-        """既存の現行草案・承認をSQLへ同期し、物体採否は未確認のまま移行する。
+    def sync_object_reviews(self, identities: set[tuple[str, str]] | None = None) -> int:
+        """既存草案をSQLへ同期し、未編集の初期旧注釈だけをタグレビュー形式へ移行する。
 
         Returns:
             同期した現行レビュー版の数。
@@ -319,6 +370,8 @@ class FileAnnotationStore:
         for path in sorted((self.root / DRAFTS_DIR).glob(f"*/{METADATA_FILE}")):
             metadata = read_json(path)
             source = metadata["source"]
+            if identities is not None and (source["session_id"], source["image_id"]) not in identities:
+                continue
             if not self._source_is_current(source):
                 continue
             revision = self._key(path.parent.name)
@@ -326,7 +379,23 @@ class FileAnnotationStore:
             if read_json(self.root / LATEST_DIR / f"{identity}.json")["revision"] != revision:
                 continue
             annotation_path = self.root / REVIEWS_DIR / revision / ANNOTATION_FILE
-            self.review_store.sync_revision(self.current_sample(source), revision, metadata, read_json(annotation_path))
+            sample = self.current_sample(source)
+            annotation = read_json(annotation_path)
+            self.review_store.sync_revision(sample, revision, metadata, annotation)
+            was_migrated = False
+            is_legacy_annotation = "tag_review_version" not in annotation
+            can_migrate = is_legacy_annotation and self._can_migrate_initial_annotation(revision, sample, progress.get(revision), persisted_progress)
+            if can_migrate:
+                candidate_records = [
+                    {"index": item["object_index"], "box": item["bbox"], "score": item["sam3_score"]}
+                    for item in self.review_store.objects(sample, revision)
+                ]
+                upgraded = self._upgrade_initial_annotation(sample, annotation, metadata, candidate_records)
+                if upgraded is not None:
+                    atomic_json(annotation_path, upgraded)
+                    annotation = upgraded
+                    self.review_store.sync_revision(sample, revision, metadata, annotation)
+                    was_migrated = True
             if not persisted_progress.get(revision):
                 state = progress.get(revision, {})
                 self.review_store.set_progress(revision, {"reviewed": state} if isinstance(state, bool) else state)
@@ -340,8 +409,117 @@ class FileAnnotationStore:
                         self.review_store.record_annotation(revision, read_json(annotation_path), "approved", approval)
                 else:
                     self.review_store.record_annotation(revision, read_json(annotation_path), "inferred")
+            if was_migrated:
+                self._record_annotation(source, revision, "inferred", annotation_path)
             synced += 1
         return synced
+
+    def _can_migrate_initial_annotation(
+        self,
+        revision: str,
+        sample: CaptureSample,
+        local_progress: Any,
+        persisted_progress: dict[str, dict[str, Any]],
+    ) -> bool:
+        """未確認・未承認の版だけを初期注釈の安全な移行対象にする。"""
+        if (self.root / APPROVALS_DIR / f"{revision}.json").exists():
+            return False
+        if self._was_reviewed(local_progress):
+            return False
+        if self.review_store is None or revision not in persisted_progress:
+            return True
+        if self._was_reviewed(persisted_progress[revision]):
+            return False
+        if self.review_store.approved(revision, scope="yolo") or self.review_store.approved(revision, scope="dino"):
+            return False
+        return all(item["dino_status"] == "pending" for item in self.review_store.objects(sample, revision))
+
+    @staticmethod
+    def _was_reviewed(state: Any) -> bool:
+        """旧形式の真偽値と現行の進捗objectから確認状態を読む。"""
+        if isinstance(state, bool):
+            return state
+        return isinstance(state, dict) and state.get("reviewed") is True
+
+    @staticmethod
+    def _upgrade_initial_annotation(
+        sample: CaptureSample,
+        annotation: dict[str, Any],
+        metadata: dict[str, Any],
+        candidate_records: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """保存内容が初期生成物と完全一致する旧注釈だけをタグレビュー形式へ移す。"""
+        if "tag_review_version" in annotation:
+            return None
+        assignments = {item["candidate_index"]: item for item in metadata["matching"]["assignments"]}
+        expected = FileAnnotationStore._legacy_initial_annotation(sample, candidate_records, assignments)
+        try:
+            saved_json = json.dumps(annotation, sort_keys=True, allow_nan=False)
+            expected_json = json.dumps(expected, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        if saved_json != expected_json:
+            return None
+        return FileAnnotationStore._versioned_initial_annotation(annotation, assignments)
+
+    @staticmethod
+    def _legacy_initial_annotation(
+        sample: CaptureSample,
+        candidate_records: list[dict[str, Any]],
+        assignments: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """再構成した旧初期注釈を手元のファイルとの厳密比較に使う。"""
+        shapes = []
+        for candidate in candidate_records:
+            index = candidate["index"]
+            assignment = assignments.get(index)
+            xmin, ymin, xmax, ymax = candidate["box"]
+            shapes.append(
+                {
+                    "label": assignment["instrument_uid"] if assignment is not None else UNRESOLVED_LABEL,
+                    "points": [[xmin, ymin], [xmax, ymax]],
+                    "group_id": index,
+                    "shape_type": RECTANGLE,
+                    "flags": {"needs_review": True},
+                    "description": json.dumps({"score": candidate["score"], "instance_no": assignment["instance_no"] if assignment is not None else None}),
+                }
+            )
+        return {
+            "version": LABELME_VERSION,
+            "flags": {"needs_review": True},
+            "shapes": shapes,
+            "imagePath": sample.source_path,
+            "imageData": None,
+            "imageWidth": sample.width,
+            "imageHeight": sample.height,
+        }
+
+    @staticmethod
+    def _versioned_initial_annotation(
+        annotation: dict[str, Any],
+        assignments: dict[int, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """未編集の旧shapeを内容を保ったまま採用shapeとレビュー候補に分ける。"""
+        shapes = []
+        review_candidates = []
+        for original_shape in annotation["shapes"]:
+            shape = dict(original_shape)
+            assignment = assignments.get(shape["group_id"])
+            shape["tag_assignment"] = (
+                {"instrument_uid": assignment["instrument_uid"], "instance_no": assignment["instance_no"]}
+                if assignment is not None
+                else None
+            )
+            if assignment is not None:
+                shapes.append(shape)
+            else:
+                review_candidates.append(shape)
+        return {
+            **annotation,
+            "tag_review_version": TAG_REVIEW_VERSION,
+            "shapes": shapes,
+            "review_candidates": review_candidates,
+        }
 
     def record_review_state(self, revision: str, reviewed: bool) -> None:
         """Persist an explicit human review check for the current annotation revision."""
@@ -362,7 +540,7 @@ class FileAnnotationStore:
         overwrite_masks: bool = False,
         assignments: dict[int, tuple[str, int] | None] | None = None,
     ) -> str:
-        """画像全体を検証し、指定時は全物体の判定も画像承認と一括確定する。
+        """画像承認を検証し、指定された物体の判定も同じ保存処理で確定する。
 
         Args:
             revision: Source draft revision.
@@ -370,7 +548,7 @@ class FileAnnotationStore:
             confirm_complete: Attestation that all visible target objects were checked.
             allow_empty: Attestation that this is a true-negative image.
             exception_note: Required explanation when visible tag counts differ.
-            decisions: 全物体の確定採否。省略時は既存の物体判定を変更しない。
+            decisions: 今回確定する物体の採否。省略時は既存の物体判定を変更しない。
             overwrite_masks: 既存承認用maskの上書きへの明示同意。
             assignments: DINO候補の手動対応。指定時はYOLO注釈を承認せずDINOだけを確定する。
 
@@ -410,7 +588,7 @@ class FileAnnotationStore:
         }
         if assignments is not None:
             if decisions is None or self.review_store is None:
-                raise CaptureError("DINO手動対応には物体レビュー保存先と全件の採否が必要である")
+                raise CaptureError("DINO手動対応には物体レビュー保存先と採否が必要である")
             content["scope"] = "dino"
             content["dino_assignments"] = {str(index): identity for index, identity in assignments.items()}
             content["dino_decisions"] = {str(index): decision for index, decision in decisions.items()}

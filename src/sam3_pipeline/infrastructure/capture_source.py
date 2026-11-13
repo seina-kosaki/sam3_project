@@ -86,6 +86,44 @@ class SqliteCaptureSource:
             except (sqlite3.Error, OSError, ValueError, KeyError, IndexError, TypeError, CaptureError) as error:
                 raise CaptureError(f"撮影セッションDBが不正である: {database}: {error}") from error
 
+    def catalog(self) -> list[dict[str, Any]]:
+        """画像内容を読まず、選択画面に必要な撮影SQL項目だけを返す。"""
+        if not self.root.is_dir():
+            raise CaptureError(f"Capture root does not exist: {self.root}")
+        databases = sorted(self.root.glob(f"*/*/{METADATA_NAME}"))
+        if not databases:
+            raise CaptureError(f"No session bundles found: {self.root}")
+        entries = []
+        try:
+            for database in databases:
+                with closing(sqlite3.connect(database.as_uri() + READ_ONLY_QUERY, uri=True, timeout=self.timeout)) as connection:
+                    connection.row_factory = sqlite3.Row
+                    rows = connection.execute(
+                        "SELECT session_id, image_id, declaration_id, arrangement_no, path, sha256, width, height, tag_revision, tag_status FROM images WHERE tag_status = ? ORDER BY image_id",
+                        (TAGGED,),
+                    ).fetchall()
+                for row in rows:
+                    image_path = (self.root / row["path"]).resolve()
+                    if not image_path.is_relative_to(self.root) or not image_path.is_file():
+                        raise CaptureError(f"Missing or unsafe image path: {row['path']}")
+                    entries.append(
+                        {
+                            "session_id": row["session_id"],
+                            "image_id": row["image_id"],
+                            "capture_date": database.parent.parent.name,
+                            "source_path": row["path"],
+                            "sha256": row["sha256"],
+                            "declaration_id": row["declaration_id"],
+                            "arrangement_no": row["arrangement_no"],
+                            "width": row["width"],
+                            "height": row["height"],
+                            "tag_revision": row["tag_revision"],
+                        }
+                    )
+        except (sqlite3.Error, OSError, ValueError, KeyError, TypeError) as error:
+            raise CaptureError(f"撮影セッションDBが不正である: {database}: {error}") from error
+        return entries
+
     def current_sample(self, session_id: str, image_id: str, source_path: str) -> CaptureSample | None:
         """照合対象のSQL行を読み、画像ファイルまで現行性を検証する。
 
