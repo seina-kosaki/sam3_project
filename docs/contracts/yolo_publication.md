@@ -1,17 +1,38 @@
 # YOLO確認・部分公開契約
 
-状態: [UI改善仕様](../review_ui_improvements.md)に対応して実装済み（2026-11-04、手動確認待ち）。追加公開は下記「実装した公開方式」の重複しない差分バッチとした。公開済み画像の変更版の再公開は未決のため保留扱いとする。
+状態: 既存の[UI改善仕様](../review_ui_improvements.md)に対応する公開契約は実装済み（2026-11-04、手動確認待ち）。追加公開は下記「実装した公開方式」の重複しない差分バッチとした。2026-11-13に合意した`POST /api/reviewed/batch`は実装済み・自動テスト済みで、手動確認待ち。公開済み画像の変更版の再公開は未決のため保留扱いとする。
 
 ## 提供側・利用側の入出力
 
 | 提供側 → 利用側 | 入力 | 出力・意味 |
 |---|---|---|
-| UI → レビューサーバー | `POST /api/reviewed`: `revision: string`、`reviewed: boolean`。既存の`allow_empty`、`exception_note`も使用 | 現行YOLO注釈の確認状態。DINO採否・承認とは独立 |
+| UI → レビューサーバー | `POST /api/reviewed`: `revision: string`、`reviewed: boolean`。既存の`allow_empty`、`exception_note`も使用 | 画像単位の現行YOLO注釈の確認状態。従来どおり維持し、DINO採否・承認とは独立 |
+| UI → レビューサーバー | `POST /api/reviewed/batch`: `session_id: string` | 指定セッションの現行・最新レビュー画像から、未確認かつ保存済み採用bboxがある画像をサーバー側で判定してYOLO確認状態を一括保存 |
 | UI → レビューサーバー | `POST /api/publish`: 現行は`session_id: string`、`reviewer: string`、`confirm_complete: true` | 現行はセッション全画像確認後、`exports/<session_id>/manifest.json`を新規公開。変更後はYOLO確認済みの今回対象だけを公開し、未確認を除外。全画像確認を意味する現行`confirm_complete`の扱いは実装前に整理する |
 | レビューデータ → UI | `GET /api/items`の`annotation` | 新規草案は`tag_review_version: 1`を使用し、一意に対応したshapeだけを`shapes`へ、未解決shapeはラベルを付けず`review_candidates`へ分ける。旧形式も読み込み可能で、初期生成時と完全一致する未確認・未承認の草案だけを自動移行する |
 | SAM3公開処理 → YOLO取得側 | 現行承認・注釈・撮影原本参照 | schema version 1のmanifestとLabelme注釈、および所属セッションDBの`sam3_yolo_results`。画像原本は複製しない |
 
 公開前のUI表示は「公開対象○件／未確認○件」。今回対象に同一データの公開済み分を再登録しない。対象0件では公開しない。bbox等のYOLO編集後は確認を解除し、再確認・必要な再承認を経る。
+
+## YOLO確認API
+
+### 画像単位確認（既存）
+
+- `POST /api/reviewed`は既存契約を維持する。`revision`と`reviewed`、既存の`allow_empty`／`exception_note`を受け取り、画像単位でYOLO確認状態を保存する。
+- 既存クライアントとの互換性を保ち、このAPIを一括確認APIに置き換えない。
+
+### セッション単位一括確認（追加）
+
+- **HTTP**: `POST`
+- **Path**: `/api/reviewed/batch`
+- **Request body**: `{"session_id": "<session_id>"}`
+- **対象の決定**: 指定セッションに属する現行・最新レビュー画像をサーバー側で調べ、未確認であり、保存済み注釈に採用bboxが1件以上ある画像だけを対象にする。レビュー版の現行性もサーバー側で判定する。
+- **対象外**: bboxがない画像。候補の採否が未確定／不採用で採用bboxがない画像も対象外。信頼度、ページネーション、UI表示・フィルターには依存しない。
+- **更新内容**: 対象画像のYOLO確認状態だけを確認済みにする。注釈、候補の採否、DINO状態、承認、公開状態を変更しない。既存の`allow_empty`と`exception_note`は変更せず保持する。
+- **成功Response (HTTP 200)**: `{"confirmed": <成功件数>, "failed": [{"revision": "<revision>", "error": "<error>"}]}`。`failed`は画像ごとの保存失敗であり、部分失敗では成功分だけを反映し、失敗した画像は未確認のままとする。対象画像が0件の場合もHTTP 200で`{"confirmed": 0, "failed": []}`を返し、保存処理は行わない。
+- **全体要求エラー (HTTP 400)**: `session_id`が文字列でない、または有効なセッションID形式でない場合は、既存のJSONエラー形式`{"error": "<message>"}`を返す。
+- 未処理画像を成功扱いにしない。既存の`POST /api/reviewed`の応答・動作は変更しない。
+- **互換性**: 既存`POST /api/reviewed`のメソッド・path・入力・画像単位動作は維持する。新API追加によって既存APIを廃止・変更しない。
 
 ## SQLiteの関連項目
 

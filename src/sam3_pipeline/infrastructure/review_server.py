@@ -170,11 +170,17 @@ class BatchReviewServer:
             if route == "/api/reviewed":
                 self._set_reviewed(payload)
                 self._respond_json(request, {"ok": True})
+            elif route == "/api/reviewed/batch":
+                result = self._confirm_session_reviewed(payload)
+                self._respond_json(request, result)
             elif route == "/api/annotation":
                 self._save_annotation(payload)
                 self._respond_json(request, {"ok": True})
             elif route == "/api/object-review":
                 self._set_object_review(payload)
+                self._respond_json(request, {"ok": True})
+            elif route == "/api/object-review/reject-all":
+                self._reject_object_reviews(payload)
                 self._respond_json(request, {"ok": True})
             elif route == "/api/approve-image":
                 self._approve_image(payload)
@@ -193,9 +199,10 @@ class BatchReviewServer:
             LOGGER.exception("Review request failed")
             self._respond_json(request, {"error": str(error)}, status=500)
 
-    def _items(self) -> list[dict[str, Any]]:
+    def _items(self, progress: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """起動時SQL集合に存在する最新リビジョンだけを一覧化する。"""
-        progress = self._read_progress()
+        if progress is None:
+            progress = self._read_progress()
         published, published_images = self._published_index()
         items = []
         for metadata_path in sorted((self.store.root / DRAFTS_DIR).glob("*/metadata.json")):
@@ -350,6 +357,16 @@ class BatchReviewServer:
             raise CaptureError("Confirm original bbox and mask before recording a decision")
         self.store.review_store.decide(sample, revision, index, status=str(payload.get("status", "")), reviewer=str(payload.get("reviewer", "")))
 
+    def _reject_object_reviews(self, payload: dict[str, Any]) -> None:
+        """画像承認やmask保存を行わず、現行候補すべての不採用を一括記録する。"""
+        if self.store.review_store is None:
+            raise CaptureError("Object review storage is not configured")
+        revision, sample = self._current_object_revision(str(payload.get("revision", "")))
+        reviewer = payload.get("reviewer")
+        if payload.get("confirm_complete") is not True or not isinstance(reviewer, str) or not reviewer.strip():
+            raise CaptureError("候補を確認し、画面上部の確認担当者を入力してください")
+        self.store.review_store.reject_all(sample, revision, reviewer=reviewer)
+
     def _set_reviewed(self, payload: dict[str, Any]) -> None:
         """Persist one explicit review check for the current revision."""
         revision = self._require_revision(str(payload.get("revision", "")))
@@ -372,6 +389,86 @@ class BatchReviewServer:
                 self.store.review_store.set_progress(revision, state)
             atomic_json(self.store.root / PROGRESS_FILE, progress)
         self.store.record_review_state(revision, state["reviewed"])
+
+    def _confirm_session_reviewed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """選択セッションの現行・最新レビューを一括確認し、保存失敗を個別に返す。"""
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str) or not SESSION_ID_PATTERN.fullmatch(session_id):
+            raise ValueError("有効なセッションを選択してください")
+
+        with self._progress_lock:
+            progress = self._read_progress()
+            items = self._items(progress=progress)
+            targets = [
+                item
+                for item in items
+                if item["session_id"] == session_id
+                and not item["reviewed"]
+                and bool(item["annotation"].get("shapes"))
+            ]
+            updated_progress = dict(progress)
+            persisted: list[tuple[str, dict[str, Any]]] = []
+            failed: list[dict[str, str]] = []
+
+            for item in targets:
+                revision = item["revision"]
+                previous_state = self._progress_state(progress.get(revision))
+                state = {
+                    "reviewed": True,
+                    "exception_note": item["exception_note"],
+                    "allow_empty": item["allow_empty"],
+                }
+                try:
+                    self._save_batch_review_state(revision, state)
+                except Exception as error:
+                    rollback_error = self._restore_batch_review_state(revision, previous_state)
+                    error_message = str(error)
+                    if rollback_error:
+                        error_message += f"; rollback failed: {rollback_error}"
+                    failed.append({"revision": revision, "error": error_message})
+                    continue
+                updated_progress[revision] = state
+                persisted.append((revision, previous_state))
+
+            if persisted:
+                try:
+                    atomic_json(self.store.root / PROGRESS_FILE, updated_progress)
+                except Exception as error:
+                    for revision, previous_state in persisted:
+                        rollback_error = self._restore_batch_review_state(revision, previous_state)
+                        error_message = str(error)
+                        if rollback_error:
+                            error_message += f"; rollback failed: {rollback_error}"
+                        failed.append({"revision": revision, "error": error_message})
+                    try:
+                        atomic_json(self.store.root / PROGRESS_FILE, progress)
+                    except Exception:
+                        LOGGER.exception("一括YOLO確認の進捗JSONを復元できません")
+                    persisted.clear()
+
+            return {"confirmed": len(persisted), "failed": failed}
+
+    def _save_batch_review_state(self, revision: str, state: dict[str, Any]) -> None:
+        """一括確認の個別画像についてSQLiteと注釈台帳を同期する。"""
+        if self.store.review_store is not None:
+            self.store.review_store.set_progress(revision, state)
+        self.store.record_review_state(revision, state["reviewed"])
+
+    def _restore_batch_review_state(self, revision: str, state: dict[str, Any]) -> str | None:
+        """一括確認に失敗した画像のSQLite・台帳状態を以前の値へ戻す。"""
+        errors: list[str] = []
+        if self.store.review_store is not None:
+            try:
+                self.store.review_store.set_progress(revision, state)
+            except Exception as error:
+                errors.append(str(error))
+        try:
+            self.store.record_review_state(revision, state["reviewed"])
+        except Exception as error:
+            errors.append(str(error))
+        if errors:
+            return "; ".join(errors)
+        return None
 
     def _save_annotation(self, payload: dict[str, Any]) -> None:
         """Validate and save browser edits without changing the original image."""

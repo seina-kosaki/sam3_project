@@ -206,6 +206,19 @@ class ObjectReviewStore(Protocol):
         """
         ...
 
+    def reject_all(self, sample: CaptureSample, revision: str, *, reviewer: str) -> None:
+        """画像承認を行わず、現行候補すべての不採用を一括記録する。
+
+        Args:
+            sample: 現行性を検証済みの撮影データ。
+            revision: 最新レビュー版。
+            reviewer: 確認担当者。
+
+        Raises:
+            CaptureError: 担当者、レビュー版、または候補一覧が不正な場合。
+        """
+        ...
+
     def mask_png(self, sample: CaptureSample, revision: str, object_index: int) -> bytes:
         """元maskを透明背景の重ね表示用PNGとして返す。
 

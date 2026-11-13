@@ -21,8 +21,10 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
 from dataclasses import replace
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -38,7 +40,7 @@ from capture_workflow import main
 from sam3_pipeline.domain.annotation import Assignment, Candidate, MatchResult
 from sam3_pipeline.domain.capture import CaptureError, CaptureSample, InstanceTag, TagPoint
 from sam3_pipeline.domain.confidence import ConfidenceThresholds
-from sam3_pipeline.infrastructure import capture_predictor
+from sam3_pipeline.infrastructure import capture_predictor, review_server
 from sam3_pipeline.infrastructure.annotation_ledger import SqliteAnnotationLedger
 from sam3_pipeline.infrastructure.annotation_store import ANNOTATION_FILE, REVIEWS_DIR, FileAnnotationStore, atomic_json, content_hash, digest_file, read_json
 from sam3_pipeline.infrastructure.capture_source import SqliteCaptureSource
@@ -1339,6 +1341,124 @@ def test_publish_partial_then_additional_without_duplicates(tmp_path: Path) -> N
     with pytest.raises(CaptureError, match="公開対象が0件"):
         server._publish(payload)
     assert sorted(path.name for path in (store.root / "exports").iterdir()) == ["session_a", "session_a+002"]
+
+
+class _PostRequest:
+    """テストでレビューHTTPハンドラーへJSON要求を渡す。"""
+
+    def __init__(self, path: str, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.path = path
+        self.headers = {"Content-Length": str(len(body))}
+        self.rfile = io.BytesIO(body)
+        self.wfile = io.BytesIO()
+        self.status = 200
+
+    def send_response(self, status: int) -> None:
+        self.status = status
+
+    def send_header(self, _name: str, _value: str) -> None:
+        return
+
+    def end_headers(self) -> None:
+        return
+
+    def response_json(self) -> dict[str, Any]:
+        return json.loads(self.wfile.getvalue())
+
+
+def test_reviewed_batch_http_selects_server_targets_once_and_preserves_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HTTP一括確認はサーバー一覧を1回だけ読み、bboxありの現行対象だけ保存する。"""
+    store, first, second, server = _same_session_pair(tmp_path)
+    server._set_reviewed({"revision": first, "reviewed": False, "allow_empty": True, "exception_note": "keep note"})
+    server._set_reviewed({"revision": second, "reviewed": False})
+    empty_annotation_path = store.root / "reviews" / second / "annotation.json"
+    empty_annotation = read_json(empty_annotation_path)
+    empty_annotation["shapes"] = []
+    atomic_json(empty_annotation_path, empty_annotation)
+
+    original_items = server._items
+    item_reads = 0
+
+    def count_items(*, progress: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        nonlocal item_reads
+        item_reads += 1
+        return original_items(progress=progress)
+
+    monkeypatch.setattr(server, "_items", count_items)
+    request = _PostRequest("/api/reviewed/batch", {"session_id": "session_a"})
+
+    server._handle_post(request)  # type: ignore[arg-type]
+
+    assert request.status == HTTPStatus.OK
+    assert request.response_json() == {"confirmed": 1, "failed": []}
+    assert item_reads == 1
+    states = {item["revision"]: item for item in server._items()}
+    assert states[first]["reviewed"] and states[first]["allow_empty"]
+    assert states[first]["exception_note"] == "keep note"
+    assert not states[second]["reviewed"]
+
+    empty_request = _PostRequest("/api/reviewed/batch", {"session_id": "session_a"})
+    server._handle_post(empty_request)  # type: ignore[arg-type]
+    assert empty_request.status == HTTPStatus.OK
+    assert empty_request.response_json() == {"confirmed": 0, "failed": []}
+
+    invalid_request = _PostRequest("/api/reviewed/batch", {"session_id": "../invalid"})
+    server._handle_post(invalid_request)  # type: ignore[arg-type]
+    assert invalid_request.status == HTTPStatus.BAD_REQUEST
+    assert "error" in invalid_request.response_json()
+
+
+def test_reviewed_batch_reports_partial_persistence_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """画像別の保存失敗では成功分だけ確認し、失敗分の状態を復元する。"""
+    store, first, second, server = _same_session_pair(tmp_path)
+    server._set_reviewed({"revision": first, "reviewed": False, "allow_empty": True, "exception_note": "preserve"})
+    server._set_reviewed({"revision": second, "reviewed": False, "exception_note": "also preserve"})
+    original_record = store.record_review_state
+
+    def fail_second_confirmation(revision: str, reviewed: bool) -> None:
+        if revision == second and reviewed:
+            raise OSError("simulated ledger failure")
+        original_record(revision, reviewed)
+
+    monkeypatch.setattr(store, "record_review_state", fail_second_confirmation)
+    original_items = server._items
+    item_reads = 0
+
+    def count_items(*, progress: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        nonlocal item_reads
+        item_reads += 1
+        return original_items(progress=progress)
+
+    original_atomic_json = review_server.atomic_json
+    progress_writes = 0
+
+    def count_progress_writes(path: Path, data: Any) -> None:
+        nonlocal progress_writes
+        if path.name == "review_progress.json":
+            progress_writes += 1
+        original_atomic_json(path, data)
+
+    monkeypatch.setattr(server, "_items", count_items)
+    monkeypatch.setattr(review_server, "atomic_json", count_progress_writes)
+
+    result = server._confirm_session_reviewed({"session_id": "session_a"})
+
+    assert result == {
+        "confirmed": 1,
+        "failed": [{"revision": second, "error": "simulated ledger failure"}],
+    }
+    assert item_reads == 1
+    assert progress_writes == 1
+    states = {item["revision"]: item for item in server._items()}
+    assert states[first]["reviewed"] and states[first]["allow_empty"]
+    assert states[first]["exception_note"] == "preserve"
+    assert not states[second]["reviewed"]
+    assert states[second]["exception_note"] == "also preserve"
 
 
 def test_publish_edit_clears_yolo_review_and_holds_changed_published_version(tmp_path: Path) -> None:

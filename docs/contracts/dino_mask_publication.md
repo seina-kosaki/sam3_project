@@ -1,8 +1,10 @@
 # DINO正式maskの保存・公開契約
 
-状態: [修正仕様](../dino_mask_save_fix.md)に対応する実装済み契約。手動確認待ち。HTTP API・DBスキーマの追加変更はない。
+状態: [修正仕様](../dino_mask_save_fix.md)に対応する実装済み契約。手動確認待ち。DINOスキップ用のローカルレビューAPIを追加し、DBスキーマは変更しない。
 
-追加仕様（2026-11-13）: タグごとに採用候補を1つとし、同じタグの残り候補は自動で不採用にする。`POST /api/complete-review`の`decisions`と`assignments`は今回確定する候補だけを含められる。画像内の採用候補が0件なら保存・承認・mask整理を行わない。採用候補のないタグはpendingのまま残し、他タグの採用候補の保存を妨げない。新しいHTTP項目やDB列は追加しない。
+追加仕様（2026-11-13）: タグごとに採用候補を1つとし、同じタグの残り候補は自動で不採用にする。`POST /api/complete-review`の`decisions`と`assignments`は今回確定する候補だけを含められる。画像内の採用候補が0件なら通常の保存・承認・mask整理を行わない。採用候補のないタグはpendingのまま残し、他タグの採用候補の保存を妨げない。
+
+追加仕様（2026-11-13）: 「採用せずスキップ」は`POST /api/object-review/reject-all`を使い、現行候補すべての不採用履歴だけを一括保存する。画像承認・mask保存／整理は行わず、DBスキーマも変更しない。
 
 ## 提供側・利用側の入出力
 
@@ -10,9 +12,12 @@
 |---|---|---|
 | レビューサーバー → UI | `GET /api/items` | 画像の`revision`と候補の`object_index`、`dino_status`、`saved_mask_exists`等。存在情報は取得時点の正式保存先の実ファイル有無であり、採用・承認の証拠ではない |
 | UI → レビューサーバー | `POST /api/complete-review` | `revision: string`、`reviewer: string`、`confirm_complete: true`、今回確定する候補の`decisions: [{object_index: integer, status: "accepted" または "rejected"}]`。未指定の候補の状態は維持する。既存の`assignments`、`overwrite_masks`、`allow_empty`、`exception_note`も引き続き使用する |
+| UI → レビューサーバー | `POST /api/object-review/reject-all` | `revision: string`、`reviewer: string`、`confirm_complete: true`。現行候補すべてを一つのSQLトランザクションで不採用として記録し、画像承認・mask保存／整理は行わない |
 | SAM3保存処理 → DINO取得側 | 現行画像・推論・確定採否・対応・画像承認 | 所属セッションDBの`sam3_dino_results`、`sam3_dino_objects`および採用mask PNG。取得側は公開条件と実ファイルの存在・hashを照合する |
 
 `assignments`は既存どおり省略可能。指定時は今回確定する候補の`object_index`、`instrument_uid: string または null`、`instance_no: integer または null`を渡し、未対応は両方nullにする。`assignments`の候補番号は`decisions`の候補番号に含まれる必要がある。`overwrite_masks`は省略時は同意なしで、trueだけが明示同意。`allow_empty`／`exception_note`と、`assignments`省略時の従来の画像承認条件は変更しない。
+
+`POST /api/object-review/reject-all`は、候補一覧が空でない現行レビュー版だけを受け付ける。不採用の履歴と現在状態を同時に確定し、失敗時は候補の状態を部分更新しない。通常の`POST /api/complete-review`では採用候補0件を引き続き拒否する。
 
 UIは未保存の今回採否で採用対象を選び、最新存在情報を同じレビュー版・候補indexで照合する。サーバーも今回採用する同じ保存先だけに上書き同意を適用する。不採用ファイルの存在・削除は上書き確認の条件ではない。
 
@@ -41,7 +46,7 @@ UIは未保存の今回採否で採用対象を選び、最新存在情報を同
 ## 保存・読み取り可能時点
 
 - 確認用maskの保持・推論情報の記録だけでは正式PNG保存・DINO公開としない。
-- 対象画像に採用候補が1件以上ある場合の保存成功時に、今回acceptedのPNGだけを作成／置換し、対象画像が所有する不要な承認用maskを整理する。採用切替前のmaskと既存バグ由来の不採用maskを含む。他画像・他セッションへの一括整理はしない。採用候補が0件なら保存・承認・整理を行わない。
+- 対象画像に採用候補が1件以上ある場合の通常保存成功時に、今回acceptedのPNGだけを作成／置換し、対象画像が所有する不要な承認用maskを整理する。採用切替前のmaskと既存バグ由来の不採用maskを含む。他画像・他セッションへの一括整理はしない。通常保存で採用候補が0件なら保存・承認・整理を行わない。スキップ操作は不採用状態だけを記録し、承認・maskを変更しない。
 - 採否・対応・承認・承認用mask台帳・DINO公開スナップショットを同じ保存処理で確定する。通常の保存失敗とSQL確定失敗では、削除分を含むファイルとDB状態を維持／復元する。プロセス強制終了への保証は従来どおり追加しない。
 - 下流は確定後の`is_dino_ready=1`または公開ビューを使う。現行版、有効な画像承認、accepted、器具対応、撮影タグ版・原本情報の一致など既存条件を維持する。タグごとの候補確定は独立しており、accepted候補だけが公開対象になる。採用候補0件では保存自体を行わない。
 - 保存時、対象画像の全レビュー版の`sam3_approved_masks`行を外し、今回acceptedの現行版だけに正式PNGのパス・hashを登録する。同じトランザクションの公開同期により、旧版／不採用候補の`sam3_dino_results`は推論参照（`memory:`を含む）へ戻り、旧版は非公開、不採用は`is_dino_ready=0`となる。不採用の判定行と採否・対応・レビューイベントは保持する。履歴中の当時のパス・hashは現存保証ではない。

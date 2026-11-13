@@ -515,6 +515,39 @@ class SqliteObjectReviewStore:
             connection.execute("INSERT INTO sam3_object_review_events(revision, object_index, dino_status, reviewer) VALUES (?, ?, ?, ?)", (revision, object_index, status, reviewer.strip()))
             connection.execute("UPDATE sam3_object_reviews SET dino_status=?, reviewer=?, reviewed_at=CURRENT_TIMESTAMP WHERE revision=? AND object_index=?", (status, reviewer.strip(), revision, object_index))
 
+    def reject_all(self, sample: CaptureSample, revision: str, *, reviewer: str) -> None:
+        """画像承認やmask保存をせず、現行候補すべての不採用を一括記録する。
+
+        Args:
+            sample: 現行性を検証済みの撮影スナップショット。
+            revision: 最新レビュー版。
+            reviewer: 確認担当者。
+
+        Raises:
+            CaptureError: 担当者、レビュー版、または候補一覧が不正な場合。
+        """
+        reviewer_name = reviewer.strip()
+        if not reviewer_name:
+            raise CaptureError("A reviewer is required")
+        with self._connection(sample=sample) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._current(connection, sample, revision)
+            objects = connection.execute(
+                "SELECT object_index FROM sam3_object_reviews WHERE revision=? ORDER BY object_index",
+                (revision,),
+            ).fetchall()
+            if not objects:
+                raise CaptureError("保存対象の候補を指定してください")
+            for item in objects:
+                connection.execute(
+                    "INSERT INTO sam3_object_review_events(revision, object_index, dino_status, reviewer) VALUES (?, ?, 'rejected', ?)",
+                    (revision, item["object_index"], reviewer_name),
+                )
+                connection.execute(
+                    "UPDATE sam3_object_reviews SET dino_status='rejected', reviewer=?, reviewed_at=CURRENT_TIMESTAMP WHERE revision=? AND object_index=?",
+                    (reviewer_name, revision, item["object_index"]),
+                )
+
     def mask_png(self, sample: CaptureSample, revision: str, object_index: int) -> bytes:
         """原本maskを透明背景で可視化し、補正せずに重ね表示へ渡す。
 

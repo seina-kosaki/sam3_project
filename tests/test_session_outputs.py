@@ -197,6 +197,31 @@ def test_complete_review_rejects_save_without_an_accepted_mask(workflow: Workflo
     assert not (session_database(workflow.root, sample.session_id).parent / "masks" / "image_000.png").exists()
 
 
+def test_reject_all_object_reviews_saves_rejections_without_approval(workflow: Workflow) -> None:
+    """候補一括スキップは不採用履歴だけを保存し、承認やmaskを作らない。"""
+    sample = workflow.samples[0]
+    revision = workflow.revisions[sample.session_id]
+    server = BatchReviewServer(workflow.store, ConfidenceThresholds(0.65, 0.85), workflow.samples)
+
+    server._reject_object_reviews({
+        "revision": revision,
+        "reviewer": "operator",
+        "confirm_complete": True,
+    })
+
+    objects = workflow.reviews.objects(sample, revision)
+    assert [item["dino_status"] for item in objects] == ["rejected"]
+    assert not workflow.reviews.approved(revision)
+    assert not (workflow.store.root / "approvals" / f"{revision}.json").exists()
+    assert not objects[0]["saved_mask_exists"]
+    assert _flags(workflow, sample) == (0, 0)
+    with closing(sqlite3.connect(session_database(workflow.root, sample.session_id))) as connection:
+        assert connection.execute(
+            "SELECT dino_status, reviewer FROM sam3_object_review_events WHERE revision=?",
+            (revision,),
+        ).fetchall() == [("rejected", "operator")]
+
+
 def test_complete_review_saves_selected_tag_and_leaves_other_candidates_pending(workflow: Workflow) -> None:
     """採用タグだけ保存し、未確認の別候補はpendingのまま残す。"""
     sample = workflow.samples[0]

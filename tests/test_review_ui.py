@@ -333,12 +333,57 @@ await document.querySelector("#save-object-review").callbacks.click();
     assert actual["log"]["opened"] == []
 
 
+def test_dino_skip_rejects_all_candidates_and_moves_next() -> None:
+    """採用候補がなくても全候補を不採用保存し、既存順序の次画像へ進む。"""
+    actual = _run_ui(DINO_SETUP + """
+request = async (url, method, payload) => {
+  if (method === "POST") log.posts.push({url, payload});
+  return latest;
+};
+await document.querySelector("#skip-object-review").callbacks.click();
+return items[0].objects.map(object => object.dino_status);
+""", DINO_ITEM)
+
+    assert actual["log"]["posts"] == [{
+        "url": "/api/object-review/reject-all",
+        "payload": {"revision": "r1", "reviewer": "operator", "confirm_complete": True},
+    }]
+    assert actual["result"] == ["rejected", "rejected"]
+    assert actual["log"]["opened"] == ["r2"]
+    assert actual["log"]["closes"] == 1
+
+
+def test_dino_skip_at_session_end_uses_existing_completion_behavior() -> None:
+    """セッション末尾のスキップは通常保存と同じ完了通知になる。"""
+    actual = _run_ui(DINO_SETUP + """
+items = [structuredClone(testItem)];
+request = async (url, method, payload) => {
+  if (method === "POST") log.posts.push({url, payload});
+  return {items: [structuredClone(testItem)]};
+};
+await document.querySelector("#skip-object-review").callbacks.click();
+""", DINO_ITEM)
+
+    assert len(actual["log"]["posts"]) == 1
+    assert actual["log"]["opened"] == []
+    assert actual["log"]["closes"] == 1
+    assert actual["notice"] == "セッション末尾まで保存しました。YOLO公開は一覧画面から実行してください。"
+    assert actual["noticeClass"] == "success"
+
+
+def test_dino_skip_button_precedes_save_button() -> None:
+    """スキップ操作を「保存して次へ」の左隣に配置する。"""
+    html = REVIEW_HTML.read_text(encoding="utf-8")
+
+    assert html.index('id="skip-object-review"') < html.index('id="save-object-review"')
+
+
 def test_dino_partial_save_skips_pending_candidates_and_moves_next() -> None:
     """採用maskを確認すれば、未確認の別候補を残したまま保存できる。"""
     actual = _run_ui(DINO_SETUP + """
 request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return latest; };
 viewedObjects = new Set([0]);
-await document.querySelector("#save-object-review").callbacks.click();
+await document.querySelector("#save-object-review").callbacks.click({type: "click"});
 return {dino: items[0].dino_approved, timings: window.reviewSaveTimings.length};
 """, DINO_ITEM)
 
@@ -402,8 +447,8 @@ return objects.map(object => [object.dino_status, object.instrument_uid, object.
     ]
 
 
-def test_yolo_session_bulk_confirmation_ignores_filter_and_pagination() -> None:
-    """信頼度・表示ページによらず、選択セッションのbboxあり未確認画像を一括確認する。"""
+def test_yolo_session_bulk_confirmation_sends_only_the_selected_session() -> None:
+    """対象選定をサーバーに委ね、選択セッションIDだけを一括確認APIへ送る。"""
     actual = _run_ui("""
 items = Array.from({length: 51}, (_, index) => ({
   ...structuredClone(testItem), revision: `skip-${index}`, session_id: "selected",
@@ -420,13 +465,22 @@ selectedSession = "selected";
 currentFilter = "high";
 galleryPage = 0;
 renderGallery();
-request = async (url, method, payload) => { if (method === "POST") log.posts.push(payload); return {}; };
+request = async (url, method, payload) => {
+  if (method === "POST") {
+    log.posts.push({url, payload});
+    for (const item of items) {
+      if (item.session_id === payload.session_id && !item.reviewed && item.annotation.shapes.length > 0) item.reviewed = true;
+    }
+    return {confirmed: 3, failed: []};
+  }
+  return {items, sessions: ["selected", "other"]};
+};
 await document.querySelector("#confirm-session-yolo").callbacks.click();
 return items.map(item => [item.revision, item.reviewed]);
 """, DINO_ITEM)
 
-    assert [post["revision"] for post in actual["log"]["posts"]] == [
-        "high-first-page", "high-second-page", "low-hidden-by-filter",
+    assert actual["log"]["posts"] == [
+        {"url": "/api/reviewed/batch", "payload": {"session_id": "selected"}},
     ]
     reviewed = dict(actual["result"])
     assert reviewed["high-first-page"] is True
@@ -439,30 +493,69 @@ return items.map(item => [item.revision, item.reviewed]);
     assert actual["noticeClass"] == "success"
 
 
-def test_yolo_session_bulk_confirmation_reports_partial_failures() -> None:
-    """画像単位の失敗を隠さず、成功分だけ確認済みに更新する。"""
+def test_yolo_session_bulk_confirmation_reports_refresh_failure_after_post_success() -> None:
+    """確認POST後の一覧再読込に失敗した場合、成功通知で上書きしない。"""
+    actual = _run_ui("""
+items = [structuredClone(testItem)];
+selectedSession = "selected";
+renderGallery();
+request = async (url, method, payload) => {
+  if (method === "POST") {
+    log.posts.push({url, payload});
+    return {confirmed: 1, failed: []};
+  }
+  throw new Error("list refresh failed");
+};
+await document.querySelector("#confirm-session-yolo").callbacks.click();
+return document.querySelector("#confirm-session-yolo").disabled;
+""", DINO_ITEM)
+
+    assert actual["log"]["posts"] == [
+        {"url": "/api/reviewed/batch", "payload": {"session_id": "selected"}},
+    ]
+    assert "一括確認処理は完了しました" in actual["notice"]
+    assert "一覧更新に失敗しました" in actual["notice"]
+    assert "ページを再読み込みしてください" in actual["notice"]
+    assert "セッション内の対象画像 1件をYOLO確認済みにしました" not in actual["notice"]
+    assert actual["noticeClass"] == "error"
+    assert actual["result"] is False
+
+
+def test_yolo_session_bulk_confirmation_reports_image_specific_failures() -> None:
+    """サーバーの部分失敗を画像別に表示し、処理中はボタンを無効にする。"""
     actual = _run_ui("""
 items = [
-  {...structuredClone(testItem), revision: "ok", session_id: "selected", reviewed: false, approved: false,
+ {...structuredClone(testItem), revision: "ok", image_id: "image-ok", session_id: "selected", reviewed: false, approved: false,
    reasons: [], annotation: {shapes: [{label: "tool", points: [[0, 0], [2, 2]]}]}},
-  {...structuredClone(testItem), revision: "failed", session_id: "selected", reviewed: false, approved: false,
+ {...structuredClone(testItem), revision: "failed", image_id: "image-failed", session_id: "selected", reviewed: false, approved: false,
    reasons: [], annotation: {shapes: [{label: "tool", points: [[0, 0], [2, 2]]}]}},
 ];
 selectedSession = "selected";
 renderGallery();
+let completeBatch;
 request = async (url, method, payload) => {
-  if (method === "POST" && payload.revision === "failed") throw new Error("failed request");
-  if (method === "POST") log.posts.push(payload);
-  return {};
+ if (method === "POST") {
+   log.posts.push({url, payload});
+   return new Promise(resolve => { completeBatch = resolve; });
+ }
+ items[0].reviewed = true;
+ return {items, sessions: ["selected"]};
 };
-await document.querySelector("#confirm-session-yolo").callbacks.click();
-return items.map(item => item.reviewed);
+const pending = document.querySelector("#confirm-session-yolo").callbacks.click();
+const disabledWhileSaving = document.querySelector("#confirm-session-yolo").disabled;
+completeBatch({confirmed: 1, failed: [{revision: "failed", error: "simulated save failure"}]});
+await pending;
+return {reviewed: items.map(item => item.reviewed), disabledWhileSaving};
 """, DINO_ITEM)
 
-    assert actual["log"]["posts"] == [{"revision": "ok", "reviewed": True}]
-    assert actual["result"] == [True, False]
+    assert actual["log"]["posts"] == [
+        {"url": "/api/reviewed/batch", "payload": {"session_id": "selected"}},
+    ]
+    assert actual["result"]["reviewed"] == [True, False]
+    assert actual["result"]["disabledWhileSaving"] is True
     assert "1件成功、1件失敗" in actual["notice"]
-    assert "failed request" in actual["notice"]
+    assert "image-failed" in actual["notice"]
+    assert "simulated save failure" in actual["notice"]
     assert actual["noticeClass"] == "error"
 
 

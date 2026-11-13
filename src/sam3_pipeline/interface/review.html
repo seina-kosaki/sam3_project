@@ -282,6 +282,7 @@
     <div class="detail-foot">
       <span id="detail-hint">YOLO注釈を修正するとYOLO確認済みは解除されます。保存後に再確認してください。</span>
       <button class="primary" id="save-detail">修正を保存</button>
+      <button class="secondary" id="skip-object-review" hidden>採用せずスキップ</button>
       <button class="primary" id="save-object-review" hidden>保存して次へ</button>
     </div>
   </dialog>
@@ -637,6 +638,7 @@
       document.querySelector("#yolo-controls").hidden = mode !== "yolo";
       document.querySelector("#dino-controls").hidden = mode !== "dino";
       document.querySelector("#save-detail").hidden = mode !== "yolo";
+      document.querySelector("#skip-object-review").hidden = mode !== "dino";
       document.querySelector("#save-object-review").hidden = mode !== "dino";
       document.querySelector("#detail-hint").hidden = mode === "dino";
       detailCanvas.style.cursor = mode === "dino" ? "pointer" : tagEditor?.mode === "draw" ? "crosshair" : "pointer";
@@ -808,16 +810,18 @@
     function setSavingState(saving) {
       savingReview = saving;
       document.querySelector("#save-object-review").ariaBusy = String(saving);
+      document.querySelector("#skip-object-review").ariaBusy = String(saving);
       if (saving) document.querySelector("#object-message").textContent = "保存中…（完了まで次の画像へ進みません）";
     }
 
     function updateDinoSaveAvailability() {
       const accepted = (selectedItem?.objects || []).filter(object => object.dino_status === "accepted");
       const acceptedMasksViewed = accepted.every(object => viewedObjects.has(object.object_index));
+      document.querySelector("#skip-object-review").disabled = !(selectedItem?.objects || []).length;
       document.querySelector("#save-object-review").disabled = accepted.length === 0 || !acceptedMasksViewed;
     }
 
-    async function saveObjectReview() {
+    async function saveObjectReview(skipWithoutAcceptance = false) {
       if (savingReview) return;
       const controls = [...detailDialog.querySelectorAll("button, input, select")].map(element => [element, element.disabled]);
       const timing = {mode: "tag_review", start: performance.now()};
@@ -829,9 +833,13 @@
         const reviewer = document.querySelector("#reviewer").value.trim();
         if (!reviewer) throw new Error("一度閉じて、画面上部の確認担当者を入力してください。未保存の変更がある場合は破棄の確認が表示されます。");
         const objects = selectedItem.objects || [];
+        if (skipWithoutAcceptance) {
+          for (const object of objects) object.dino_status = "rejected";
+        }
         const accepted = objects.filter(object => object.dino_status === "accepted");
-        if (!accepted.length) throw new Error("採用されたmaskがないため、DINO保存対象がありません。");
-        if (accepted.some(object => !viewedObjects.has(object.object_index))) throw new Error("採用したmaskを確認してください。");
+        if (!skipWithoutAcceptance && !accepted.length) throw new Error("採用されたmaskがないため、DINO保存対象がありません。");
+        if (!skipWithoutAcceptance && accepted.some(object => !viewedObjects.has(object.object_index))) throw new Error("採用したmaskを確認してください。");
+        if (skipWithoutAcceptance && !objects.length) throw new Error("スキップする候補がありません。");
         const decisions = objects.filter(object => object.dino_status !== "pending");
         const current = items.find(item => item.revision === selectedItem.revision);
         if (JSON.stringify(current.annotation) !== JSON.stringify(selectedItem.annotation)) throw new Error("YOLO矩形に未保存の変更がある。先に「修正を保存」を実行してください");
@@ -845,17 +853,23 @@
         if (!latest) throw new Error("レビュー版が更新されました。画面を開き直してください");
         const latestByIndex = new Map(latest.objects.map(object => [object.object_index, object]));
         if (objects.length !== latestByIndex.size || objects.some(object => !latestByIndex.has(object.object_index))) throw new Error("候補が更新されました。画面を開き直してください");
-        const overwriteMasks = accepted.some(object => latestByIndex.get(object.object_index).saved_mask_exists);
-        if (overwriteMasks && !await confirmMaskOverwrite()) {
+        const overwriteMasks = !skipWithoutAcceptance && accepted.some(object => latestByIndex.get(object.object_index).saved_mask_exists);
+        if (!skipWithoutAcceptance && overwriteMasks && !await confirmMaskOverwrite()) {
           document.querySelector("#object-message").textContent = "保存を中止しました。既存maskと判定は変更していません。";
           return;
         }
         started = performance.now();
-        await request("/api/complete-review", "POST", {revision: selectedItem.revision, reviewer, confirm_complete: true,
-          overwrite_masks: overwriteMasks,
-          decisions: decisions.map(object => ({object_index: object.object_index, status: object.dino_status})),
-          assignments: decisions.map(object => ({object_index: object.object_index, instrument_uid: object.instrument_uid, instance_no: object.instance_no})),
-          allow_empty: selectedItem.allow_empty, exception_note: selectedItem.exception_note});
+        if (skipWithoutAcceptance) {
+          await request("/api/object-review/reject-all", "POST", {
+            revision: selectedItem.revision, reviewer, confirm_complete: true
+          });
+        } else {
+          await request("/api/complete-review", "POST", {revision: selectedItem.revision, reviewer, confirm_complete: true,
+            overwrite_masks: overwriteMasks,
+            decisions: decisions.map(object => ({object_index: object.object_index, status: object.dino_status})),
+            assignments: decisions.map(object => ({object_index: object.object_index, instrument_uid: object.instrument_uid, instance_no: object.instance_no})),
+            allow_empty: selectedItem.allow_empty, exception_note: selectedItem.exception_note});
+        }
         timing.save_api_ms = performance.now() - started;
         // 成功済みの採否を保持し、一覧の再読込失敗時も保存漏れと誤認させない。YOLO確認状態は変えない。
         current.objects = structuredClone(objects);
@@ -891,7 +905,8 @@
       }
     }
 
-    document.querySelector("#save-object-review").addEventListener("click", saveObjectReview);
+    document.querySelector("#save-object-review").addEventListener("click", () => saveObjectReview());
+    document.querySelector("#skip-object-review").addEventListener("click", () => saveObjectReview(true));
 
     function renderShapeList() {
       if (!tagEditor) return;
@@ -1121,38 +1136,41 @@
     });
 
     document.querySelector("#confirm-session-yolo").addEventListener("click", async () => {
-      const sessionItems = items.filter(item => item.session_id === selectedSession);
-      const targets = sessionItems.filter(item => !item.reviewed && !item.approved && item.annotation.shapes.length > 0);
-      if (!targets.length) {
-        showNotice("一括確認できる未確認画像がありません（採用bboxがある画像だけが対象です）。", "error");
+      if (!selectedSession) {
+        showNotice("一括確認するセッションを選択してください。", "error");
         return;
       }
 
       const button = document.querySelector("#confirm-session-yolo");
       button.disabled = true;
+      showNotice("セッション内の対象画像を一括確認しています。");
       try {
-        const results = await Promise.allSettled(targets.map(item =>
-          request("/api/reviewed", "POST", {revision: item.revision, reviewed: true})
-        ));
-        let confirmed = 0;
-        const failures = [];
-        results.forEach((result, index) => {
-          if (result.status === "fulfilled") {
-            targets[index].reviewed = true;
-            confirmed += 1;
-          } else {
-            failures.push(result.reason);
-          }
+        const revisionItems = new Map(items.map(item => [item.revision, item]));
+        const result = await request("/api/reviewed/batch", "POST", {session_id: selectedSession});
+        const failures = Array.isArray(result.failed) ? result.failed : [];
+        const failureDetails = failures.map(failure => {
+          const item = revisionItems.get(failure.revision);
+          const imageId = item ? item.image_id : failure.revision;
+          return `${imageId}: ${failure.error}`;
         });
-        renderGallery();
-        if (failures.length) {
-          const firstError = failures[0] instanceof Error ? failures[0].message : String(failures[0]);
-          showNotice(`一括確認は一部のみ完了しました: ${confirmed}件成功、${failures.length}件失敗。失敗例: ${firstError}`, "error");
+        const listUpdated = await loadItems();
+        if (!listUpdated) {
+          const failureSummary = failures.length ? `。${failureDetails.join(" / ")}` : "";
+          showNotice(
+            `一括確認処理は完了しました（${result.confirmed}件成功、${failures.length}件失敗）が、一覧更新に失敗しました。ページを再読み込みしてください${failureSummary}`,
+            "error"
+          );
           return;
         }
-        showNotice(`セッション内の未確認画像 ${confirmed}件をYOLO確認済みにしました。`, "success");
+        if (failures.length) {
+          showNotice(`一括確認: ${result.confirmed}件成功、${failures.length}件失敗。${failureDetails.join(" / ")}`, "error");
+          return;
+        }
+        showNotice(`セッション内の対象画像 ${result.confirmed}件をYOLO確認済みにしました。`, "success");
+      } catch (error) {
+        showNotice(error.message, "error");
       } finally {
-        button.disabled = false;
+        button.disabled = !selectedSession;
       }
     });
 
