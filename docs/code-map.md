@@ -9,7 +9,7 @@
 | [src/sam3_pipeline/usecase/capture.py](../src/sam3_pipeline/usecase/capture.py) | 撮影サンプルを推論結果とレビュー草案へつなぐ |
 | [src/sam3_pipeline/infrastructure/capture_predictor.py](../src/sam3_pipeline/infrastructure/capture_predictor.py) | SAM3共通プロンプト推論を行い、設定有効時はYOLOの全bboxをvisual promptとして追加し、SAM3候補だけを返す |
 | [src/yolov12/inference.py](../src/yolov12/inference.py) | settings_yolo.yamlから重みを解決し、単体用既定値またはcapture指定confidenceでYOLO検出する |
-| [src/sam3_pipeline/infrastructure/capture_source.py](../src/sam3_pipeline/infrastructure/capture_source.py) | セッションDBから検証済みの撮影画像・タグを読み取る |
+| [src/sam3_pipeline/infrastructure/capture_source.py](../src/sam3_pipeline/infrastructure/capture_source.py) | targetsの範囲にある安全なセッションDBから検証済みの撮影画像・タグを読み取る |
 | [src/sam3_pipeline/infrastructure/selection_server.py](../src/sam3_pipeline/infrastructure/selection_server.py) | 画像内容の読み込み前に対象を選び、同じserverを維持してレビュー後の再選択を受け付ける |
 | [src/sam3_pipeline/infrastructure/review_server.py](../src/sam3_pipeline/infrastructure/review_server.py) | ローカルレビュー画面とレビューAPIを提供し、run時は既存選択画面への復帰をCLIへ通知する。YOLO一括公開時の注釈検証を画像・shape／fieldが特定できる文脈付きで報告し、DINO一覧に永続化状態を反映する |
 | [src/sam3_pipeline/infrastructure/annotation_store.py](../src/sam3_pipeline/infrastructure/annotation_store.py) | YOLO注釈・画像承認を保存し、公開用rectangle・UID検証を行う。未編集の初期旧注釈だけをタグレビュー形式へ移行し、公開時の検証エラーでshape／fieldを特定できる情報を返す |

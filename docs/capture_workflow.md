@@ -22,6 +22,7 @@
 | 項目 | 用途 |
 |---|---|
 | `capture_root` | 撮影APIの `IC_DATA_DIR`。画像の `images.path` はこのルート基準 |
+| `targets` | 任意。`date`必須、`session_id`任意の日付・セッション対象条件。複数条件はORで、同じDBは一度だけ処理する。指定時は入力・現行性確認・レビュー/推論の保存先を対象DBに限定する |
 | `output_root` | 撮影データと分離したアノテーション作業領域 |
 | `mask_root` | `capture_root`内の物体別mask PNG保存先。省略時は`capture_root/annotations/sam3` |
 | `checkpoint` | 任意のローカルSAM3重み。`null` の場合はSAM3モデルビルダーがHugging Faceから取得する |
@@ -37,6 +38,28 @@
 | `review_confidence.high_score` | 高信頼度として扱う最低SAM3スコア。タグ点がbbox内で、対応が曖昧でないことも必要 |
 
 各セッションSQLiteの`tagged`行と`images.path`がアノテーション対象を決める。`capture_root`にはDBファイルやセッションディレクトリではなく、共有データルートを指定する。画像パスも引き続きこのルートを基準に解決する。レビュー画面は起動時点の対象集合に固定し、後から追加された画像は次回起動で取り込む。別PCのデータを使う場合も、そのPCの`IC_DATA_DIR`を本設定の`capture_root`に指定する。
+
+`targets`を設定すると、推論・選択一覧・SQL上の現行性確認はその範囲のセッションDBだけを参照する。各条件は`{"date":"YYYY-MM-DD"}`または`{"date":"YYYY-MM-DD","session_id":"session_001"}`で、条件の組み合わせはORである。日付は実在する日付、セッションIDは英数字で始まる英数字・`.`・`_`・`-`の80文字以内に限る。条件の一部でも対応DBがない場合や、`targets`が空・不正な場合はエラーとして停止する。`targets`キーを省略した場合だけ従来どおり全セッションDBを対象とする。
+
+`capture.json`では、次のように`targets`を追加する。
+
+```json
+{
+  "capture_root": "../../../shared_data/",
+  "output_root": "../../../annotation_work",
+  "targets": [
+    {
+      "date": "2026-11-24"
+    },
+    {
+      "date": "2026-11-25",
+      "session_id": "session_001"
+    }
+  ]
+}
+```
+
+この例では、`2026-11-24`の全セッションと、`2026-11-25`の`session_001`だけが対象になる。特定セッションだけに絞る場合は、`date`と`session_id`を指定する。日付ごとの全セッションを対象にする場合は、`session_id`を省略する。`targets`には実際に使う他の設定項目（`mask_root`、モデル設定、`matching`、`review_confidence`など）もそのまま含める。
 
 個別画像の再取得と現行性確認も所属セッションDBを参照する。タグ版が変われば古い入力は現行と扱わず、画像行・DB・画像原本の削除、未タグ化も検出する。セッションDBが一つもない場合、DB破損・スキーマ不整合・画像の不正やハッシュ不一致はエラーとし、不正DBや不正画像では対象DBを明示して処理を停止する。異常なセッションを黙って除外して続行しない。
 

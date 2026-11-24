@@ -35,7 +35,11 @@ from sam3_pipeline.domain.annotation import Candidate, Predictor
 from sam3_pipeline.domain.capture import CaptureError, CaptureSample
 from sam3_pipeline.infrastructure.annotation_store import digest_file
 from sam3_pipeline.infrastructure.matching import ArrayMask
-from sam3_pipeline.infrastructure.session_database import metadata_databases, session_database
+from sam3_pipeline.infrastructure.session_database import (
+    capture_date_from_source_path,
+    metadata_databases,
+    session_database,
+)
 
 SCHEMA_VERSION = 1
 HASH_LENGTH = 64
@@ -93,6 +97,7 @@ class SqlitePredictionStore:
         self.data_root = data_root.resolve()
         self.mask_root = mask_root.resolve()
         self.timeout = timeout
+        self.database_paths: list[Path] | None = None
         self.model_metadata = dict(model_metadata or {})
         self.predictor_factory = predictor_factory
         self._previews: dict[tuple[str, str, str], tuple[Candidate, ...]] = {}
@@ -100,13 +105,18 @@ class SqlitePredictionStore:
         if not self.mask_root.is_relative_to(self.data_root):
             raise CaptureError("Mask root must be inside data root")
 
-    def initialize(self) -> None:
+    def initialize(self, databases: list[Path] | None = None) -> None:
         """既存テーブルを変更せず、SAM3専用schemaを冪等に追加する。
 
         Raises:
             CaptureError: DBが存在しない、未対応版、またはSQLite操作に失敗した場合。
         """
         # 共有ルートにはDBを作らず、存在するセッションDBにだけschemaを追加する。
+        if databases is not None:
+            self.database_paths = databases
+            for database in databases:
+                SqlitePredictionStore(database, self.data_root, self.mask_root, self.timeout, model_metadata=self.model_metadata).initialize()
+            return
         if self.database_path.is_dir():
             for database in metadata_databases(self.database_path):
                 SqlitePredictionStore(database, self.data_root, self.mask_root, self.timeout, model_metadata=self.model_metadata).initialize()
@@ -227,7 +237,16 @@ class SqlitePredictionStore:
         Raises:
             CaptureError: 保存先が欠損、またはSQLite操作に失敗した場合。
         """
-        database = session_database(self.database_path, sample.session_id) if sample is not None else self.database_path
+        if sample is None:
+            database = self.database_path
+        else:
+            capture_date = capture_date_from_source_path(sample.source_path, sample.session_id)
+            database = session_database(
+                self.database_path,
+                sample.session_id,
+                self.database_paths,
+                capture_date,
+            )
         if not database.is_file():
             raise CaptureError(f"セッションDBが存在しない: {database}")
         try:

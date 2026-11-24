@@ -24,7 +24,7 @@ REVIEW_RETURN_QUERY = "review_complete=1"
 
 
 class SelectiveInferenceServer:
-    """撮影SQLカタログを提示し、選択完了時に画像IDだけを返す。"""
+    """撮影SQLカタログを提示し、選択完了時にsource_pathを返す。"""
 
     def __init__(
         self,
@@ -37,8 +37,17 @@ class SelectiveInferenceServer:
         self.store = store
         self.reviews = reviews
         self.entries = source.catalog()
-        self.entry_by_identity = {(item["session_id"], item["image_id"]): item for item in self.entries}
-        self.selected: list[tuple[str, str]] | None = None
+        self.entry_by_source_path = {item["source_path"]: item for item in self.entries}
+        self.entries_by_identity: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for item in self.entries:
+            identity = (item["session_id"], item["image_id"])
+            self.entries_by_identity.setdefault(identity, []).append(item)
+        self.entry_by_identity = {
+            identity: items[0]
+            for identity, items in self.entries_by_identity.items()
+            if len(items) == 1
+        }
+        self.selected: list[str] | None = None
         self.server: ThreadingHTTPServer | None = None
         self.server_thread: threading.Thread | None = None
         self.selection_ready = threading.Event()
@@ -48,8 +57,8 @@ class SelectiveInferenceServer:
         self.accepting_selection = True
         self.url: str | None = None
 
-    def select(self) -> list[tuple[str, str]]:
-        """選択画面を開き、選択されたセッション・画像IDで応答する。"""
+    def select(self) -> list[str]:
+        """選択画面を開き、選択されたsource_pathで応答する。"""
         self.start()
         with self.state_lock:
             has_pending_selection = self.selected is not None
@@ -127,8 +136,16 @@ class SelectiveInferenceServer:
                 self._respond_json(request, {"error": str(error)}, 400)
         elif route.path == "/api/image":
             query = parse_qs(route.query)
-            identity = (query.get("session_id", [""])[0], query.get("image_id", [""])[0])
-            item = self.entry_by_identity.get(identity)
+            source_path = query.get("source_path", [""])[0]
+            item = self.entry_by_source_path.get(source_path) if source_path else None
+            if not source_path:
+                identity = (query.get("session_id", [""])[0], query.get("image_id", [""])[0])
+                candidates = self.entries_by_identity.get(identity, [])
+                if len(candidates) == 1:
+                    item = candidates[0]
+                elif len(candidates) > 1:
+                    self._respond_json(request, {"error": "画像の識別が曖昧です。source_pathを指定してください"}, 400)
+                    return
             if item is None:
                 self._respond_json(request, {"error": "画像が選択一覧にありません"}, 404)
                 return
@@ -146,9 +163,13 @@ class SelectiveInferenceServer:
             self._respond_json(request, {"error": "Not found"}, 404)
 
     def _with_status(self, item: dict[str, Any]) -> dict[str, Any]:
-        identity = content_hash([item["session_id"], item["image_id"]])
+        identity = content_hash(item["source_path"])
         latest_path = self.store.root / LATEST_DIR / f"{identity}.json"
-        result = {key: item[key] for key in ("session_id", "image_id", "capture_date", "width", "height")}
+        result = {key: item[key] for key in ("session_id", "image_id", "capture_date", "source_path", "width", "height")}
+        if not latest_path.is_file():
+            legacy_latest_path = self._legacy_latest_path(item)
+            if legacy_latest_path is not None:
+                latest_path = legacy_latest_path
         result.update({"draft": False, "yolo": "未処理", "dino": "未処理"})
         if not latest_path.is_file():
             return result
@@ -157,10 +178,18 @@ class SelectiveInferenceServer:
         if not metadata_path.is_file():
             return result
         source = read_json(metadata_path).get("source", {})
-        if (source.get("session_id"), source.get("image_id")) != (item["session_id"], item["image_id"]):
+        source_identity = (source.get("session_id"), source.get("image_id"))
+        item_identity = (item["session_id"], item["image_id"])
+        path_matches = source.get("source_path") == item["source_path"]
+        if source_identity != item_identity or not path_matches:
             return result
         result["draft"] = True
-        review_state = self.reviews.catalog_state(item["session_id"], item["image_id"], str(revision))
+        review_state = self.reviews.catalog_state(
+            item["session_id"],
+            item["image_id"],
+            str(revision),
+            item["source_path"],
+        )
         if review_state is None:
             return result
         if review_state["yolo_approved"]:
@@ -171,6 +200,14 @@ class SelectiveInferenceServer:
             result["yolo"] = "未確認"
         result["dino"] = "承認済み" if review_state["dino_approved"] else review_state["dino_state"]
         return result
+
+    def _legacy_latest_path(self, item: dict[str, Any]) -> Path | None:
+        """Return the old pair-keyed latest file only for a uniquely identifiable item."""
+        identity = (item["session_id"], item["image_id"])
+        if len(self.entries_by_identity.get(identity, [])) != 1:
+            return None
+        legacy_identity = content_hash([item["session_id"], item["image_id"]])
+        return self.store.root / LATEST_DIR / f"{legacy_identity}.json"
 
     def _post(self, request: BaseHTTPRequestHandler) -> None:
         try:
@@ -208,18 +245,37 @@ class SelectiveInferenceServer:
             self.selection_ready.set()
         self._respond_json(request, {"ok": True, "count": len(identities)})
 
-    def _validated_selection(self, selected: list[Any]) -> list[tuple[str, str]] | None:
-        identities = []
+    def _validated_selection(self, selected: list[Any]) -> list[str] | None:
+        source_paths = []
         seen = set()
         for value in selected:
             if not isinstance(value, dict):
                 return None
-            identity = (value.get("session_id"), value.get("image_id"))
-            if identity not in self.entry_by_identity or identity in seen:
+            source_path = value.get("source_path")
+            if source_path is not None:
+                if not isinstance(source_path, str) or not source_path:
+                    return None
+                item = self.entry_by_source_path.get(source_path)
+                if item is None:
+                    return None
+                provided_identity = (value.get("session_id"), value.get("image_id"))
+                item_identity = (item["session_id"], item["image_id"])
+                if any(value.get(key) is not None for key in ("session_id", "image_id")) and provided_identity != item_identity:
+                    return None
+            else:
+                identity = (value.get("session_id"), value.get("image_id"))
+                if not all(isinstance(part, str) and part for part in identity):
+                    return None
+                candidates = self.entries_by_identity.get(identity, [])
+                if len(candidates) != 1:
+                    return None
+                item = candidates[0]
+                source_path = item["source_path"]
+            if source_path in seen:
                 return None
-            seen.add(identity)
-            identities.append(identity)
-        return identities
+            seen.add(source_path)
+            source_paths.append(source_path)
+        return source_paths
 
     @staticmethod
     def _respond(request: BaseHTTPRequestHandler, body: bytes, content_type: str) -> None:

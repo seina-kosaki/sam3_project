@@ -352,7 +352,11 @@ class FileAnnotationStore:
         self._record_annotation(source, revision, "inferred", review_dir / ANNOTATION_FILE)
         return revision
 
-    def sync_object_reviews(self, identities: set[tuple[str, str]] | None = None) -> int:
+    def sync_object_reviews(
+        self,
+        identities: set[tuple[str, str]] | None = None,
+        source_paths: set[str] | None = None,
+    ) -> int:
         """既存草案をSQLへ同期し、未編集の初期旧注釈だけをタグレビュー形式へ移行する。
 
         Returns:
@@ -372,11 +376,12 @@ class FileAnnotationStore:
             source = metadata["source"]
             if identities is not None and (source["session_id"], source["image_id"]) not in identities:
                 continue
+            if source_paths is not None and source["source_path"] not in source_paths:
+                continue
             if not self._source_is_current(source):
                 continue
             revision = self._key(path.parent.name)
-            identity = content_hash([source["session_id"], source["image_id"]])
-            if read_json(self.root / LATEST_DIR / f"{identity}.json")["revision"] != revision:
+            if not self.is_latest_revision(source, revision):
                 continue
             annotation_path = self.root / REVIEWS_DIR / revision / ANNOTATION_FILE
             sample = self.current_sample(source)
@@ -629,9 +634,9 @@ class FileAnnotationStore:
         if not records:
             raise CaptureError("No currently approved SQL capture images are available")
         samples: list[dict[str, Any]] = []
-        identities: set[tuple[str, str]] = set()
+        identities: set[str] = set()
         for record in records:
-            identity = (record["source"]["session_id"], record["source"]["image_id"])
+            identity = record["source"]["source_path"]
             if identity in identities:
                 raise CaptureError("Multiple source revisions approved for one image; revoke obsolete approvals first")
             identities.add(identity)
@@ -647,7 +652,7 @@ class FileAnnotationStore:
             staging.mkdir()
             for record in records:
                 source = record["source"]
-                key = content_hash([source["session_id"], source["image_id"]])
+                key = content_hash(source["source_path"])
                 relative = Path("items") / key
                 item_dir = staging / relative
                 item_dir.mkdir(parents=True)
@@ -663,6 +668,7 @@ class FileAnnotationStore:
                     image_id=record["source"]["image_id"],
                     revision=record["revision"],
                     manifest_path=manifest_path,
+                    source_path=record["source"]["source_path"],
                 )
         return destination / "manifest.json"
 
@@ -709,6 +715,7 @@ class FileAnnotationStore:
                     image_id=source["image_id"],
                     revision=revision,
                     manifest_path=str(manifest_path.resolve()),
+                    source_path=source["source_path"],
                 )
                 synced += 1
         return synced
@@ -751,6 +758,7 @@ class FileAnnotationStore:
             status=status,
             annotation_path=annotation_path.relative_to(self.root).as_posix(),
             annotation_sha256=digest_file(annotation_path),
+            source_path=source["source_path"],
             approval_id=approval.get("approval_id") if approval else None,
             reviewer=approval.get("reviewer") if approval else None,
             approved_at=approval.get("approved_at") if approval else None,
@@ -768,13 +776,30 @@ class FileAnnotationStore:
 
     def _mark_latest(self, sample: CaptureSample, revision: str) -> None:
         """Invalidate old approvals when the current source or matcher changes."""
-        identity = content_hash([sample.session_id, sample.image_id])
+        identity = content_hash(sample.source_path)
         atomic_json(self.root / LATEST_DIR / f"{identity}.json", {"revision": revision})
+
+    def is_latest_revision(self, source: dict[str, Any], revision: str) -> bool:
+        """Check the latest revision using its unique source path, with legacy-key fallback."""
+        identity = content_hash(source["source_path"])
+        latest_path = self.root / LATEST_DIR / f"{identity}.json"
+        if latest_path.is_file():
+            return read_json(latest_path).get("revision") == revision
+
+        legacy_identity = content_hash([source["session_id"], source["image_id"]])
+        legacy_path = self.root / LATEST_DIR / f"{legacy_identity}.json"
+        if not legacy_path.is_file() or read_json(legacy_path).get("revision") != revision:
+            return False
+
+        metadata_path = self.root / DRAFTS_DIR / revision / METADATA_FILE
+        if not metadata_path.is_file():
+            return False
+        saved_source = read_json(metadata_path).get("source", {})
+        return saved_source.get("source_path") == source["source_path"]
 
     def _require_latest(self, source: dict[str, Any], revision: str) -> None:
         """Do not export a historical approval after a newer draft has been generated."""
-        identity = content_hash([source["session_id"], source["image_id"]])
-        if read_json(self.root / LATEST_DIR / f"{identity}.json")["revision"] != revision:
+        if not self.is_latest_revision(source, revision):
             raise CaptureError("Source tags or matching changed; revoke the old approval and review the latest draft")
 
     def _review_image(self, data: dict[str, Any], source: dict[str, Any]) -> Path:

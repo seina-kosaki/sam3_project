@@ -34,7 +34,12 @@ from sam3_pipeline.infrastructure.annotation_store import content_hash, digest_f
 from sam3_pipeline.infrastructure.approved_masks import capture_root, mask_destination, publish_masks
 from sam3_pipeline.infrastructure.handoff_store import initialize_handoff, refresh_handoff
 from sam3_pipeline.infrastructure.matching import ArrayMask
-from sam3_pipeline.infrastructure.session_database import metadata_databases, review_database, session_database
+from sam3_pipeline.infrastructure.session_database import (
+    capture_date_from_source_path,
+    metadata_databases,
+    review_database,
+    session_database,
+)
 
 REVIEW_SCHEMA_VERSION = 5
 SUPPORTED_REVIEW_VERSIONS = frozenset({1, 2, 3, 4, REVIEW_SCHEMA_VERSION})
@@ -139,14 +144,20 @@ class SqliteObjectReviewStore:
         self.database_path = database_path.resolve()
         self.timeout = timeout
         self.predictions = predictions
+        self.database_paths: list[Path] | None = None
 
-    def initialize(self) -> None:
+    def initialize(self, databases: list[Path] | None = None) -> None:
         """撮影・推論テーブルを変更せずレビューschemaを冪等に追加する。
 
         Raises:
             CaptureError: DBが存在しない、未対応版、または追加に失敗した場合。
         """
         # セッションごとのschemaを維持し、ルート直下に集約DBを生成しない。
+        if databases is not None:
+            self.database_paths = databases
+            for database in databases:
+                SqliteObjectReviewStore(database, self.timeout, self.predictions).initialize()
+            return
         if self.database_path.is_dir():
             for database in metadata_databases(self.database_path):
                 SqliteObjectReviewStore(database, self.timeout, self.predictions).initialize()
@@ -354,7 +365,13 @@ class SqliteObjectReviewStore:
                     connection.execute("UPDATE sam3_object_reviews SET dino_status=?, reviewer=?, reviewed_at=CURRENT_TIMESTAMP WHERE revision=? AND object_index=?", (decision, reviewer, revision, index))
             if write_masks and sample is not None:
                 self._current(connection, sample, revision)
-                database = session_database(self.database_path, sample.session_id)
+                capture_date = capture_date_from_source_path(sample.source_path, sample.session_id)
+                database = session_database(
+                    self.database_path,
+                    sample.session_id,
+                    self.database_paths,
+                    capture_date,
+                )
                 root = capture_root(sample)
                 originals = connection.execute(
                     """SELECT o.object_index, o.mask_path, o.mask_sha256
@@ -473,7 +490,13 @@ class SqliteObjectReviewStore:
                 ORDER BY objects.object_index""",
                 (revision, sample.session_id, sample.image_id, prediction_id),
             ).fetchall()
-        database = session_database(self.database_path, sample.session_id)
+        capture_date = capture_date_from_source_path(sample.source_path, sample.session_id)
+        database = session_database(
+            self.database_path,
+            sample.session_id,
+            self.database_paths,
+            capture_date,
+        )
         return [{**dict(item), "bbox": json.loads(item["bbox_json"]), "saved_mask_exists": mask_destination(database, sample, item["object_index"]).exists()} for item in rows]
 
     def decide(self, sample: CaptureSample, revision: str, object_index: int, *, status: str, reviewer: str) -> None:
@@ -586,6 +609,11 @@ class SqliteObjectReviewStore:
             CaptureError: SQLまたはJSONの読み取りに失敗した場合。
         """
         # 共有ルートのときだけ各セッションへ分配し、版ごとの状態をまとめて返す。
+        if self.database_paths is not None:
+            scoped_states: dict[str, dict[str, Any]] = {}
+            for database in self.database_paths:
+                scoped_states.update(SqliteObjectReviewStore(database, self.timeout, self.predictions).progress())
+            return scoped_states
         if self.database_path.is_dir():
             states: dict[str, dict[str, Any]] = {}
             for database in metadata_databases(self.database_path):
@@ -655,9 +683,18 @@ class SqliteObjectReviewStore:
             return "判定途中"
         return "判定済み"
 
-    def catalog_state(self, session_id: str, image_id: str, revision: str) -> dict[str, Any] | None:
+    def catalog_state(
+        self,
+        session_id: str,
+        image_id: str,
+        revision: str,
+        source_path: str | None = None,
+    ) -> dict[str, Any] | None:
         """選択一覧用に、指定セッション内の登録済みレビュー状態だけを返す。"""
-        database = session_database(self.database_path, session_id)
+        if self.database_paths is not None and source_path is None:
+            raise CaptureError("対象DBを限定したレビュー確認にはsource_pathが必要である")
+        capture_date = capture_date_from_source_path(source_path, session_id) if source_path is not None else None
+        database = session_database(self.database_path, session_id, self.database_paths, capture_date)
         store = SqliteObjectReviewStore(database, self.timeout, self.predictions)
         with store._connection(refresh=False) as connection:
             has_review_schema = connection.execute(
@@ -747,9 +784,10 @@ class SqliteObjectReviewStore:
         # 画像を持つ要求はセッションID、承認・取消などの要求は保存済みレビュー版で解決する。
         database = self.database_path
         if sample is not None:
-            database = session_database(database, sample.session_id)
+            capture_date = capture_date_from_source_path(sample.source_path, sample.session_id)
+            database = session_database(database, sample.session_id, self.database_paths, capture_date)
         elif revision is not None:
-            database = review_database(database, revision, self.timeout)
+            database = review_database(database, revision, self.timeout, self.database_paths)
         if not database.is_file():
             raise CaptureError(f"セッションDBが存在しない: {database}")
         try:

@@ -25,11 +25,9 @@ from sam3_pipeline.infrastructure.annotation_store import (
     ANNOTATION_FILE,
     APPROVALS_DIR,
     DRAFTS_DIR,
-    LATEST_DIR,
     REVIEWS_DIR,
     FileAnnotationStore,
     atomic_json,
-    content_hash,
     digest_file,
     read_json,
     validate_rectangles,
@@ -64,7 +62,7 @@ class BatchReviewServer:
         """成果物領域と起動時点のSQL対象集合を結び付ける。"""
         self.store = store
         self.thresholds = thresholds
-        self.samples = {(sample.session_id, sample.image_id): sample for sample in samples}
+        self.samples = {sample.source_path: sample for sample in samples}
         self._progress_lock = threading.Lock()
         self.selection_return_url: str | None = None
 
@@ -144,8 +142,7 @@ class BatchReviewServer:
             review_dir = self.store.root / REVIEWS_DIR / revision
             annotation = read_json(review_dir / ANNOTATION_FILE)
             source = read_json(self.store.root / DRAFTS_DIR / revision / "metadata.json")["source"]
-            identity = (source["session_id"], source["image_id"])
-            sample = self.samples.get(identity)
+            sample = self.samples.get(source["source_path"])
             if sample is None or not self.store.is_current_snapshot(source, sample):
                 self._respond_json(request, {"error": "Capture source is no longer current"}, status=404)
                 return
@@ -208,22 +205,20 @@ class BatchReviewServer:
         for metadata_path in sorted((self.store.root / DRAFTS_DIR).glob("*/metadata.json")):
             revision = metadata_path.parent.name
             source = read_json(metadata_path)["source"]
-            sample = self.samples.get((source["session_id"], source["image_id"]))
+            sample = self.samples.get(source["source_path"])
             if sample is None or not self.store.is_current_snapshot(source, sample):
                 continue
-            identity = content_hash([source["session_id"], source["image_id"]])
-            latest_path = self.store.root / LATEST_DIR / f"{identity}.json"
-            if not latest_path.is_file() or read_json(latest_path).get("revision") != revision:
+            if not self.store.is_latest_revision(source, revision):
                 continue
             review_dir = self.store.root / REVIEWS_DIR / revision
             annotation = read_json(review_dir / ANNOTATION_FILE)
-            published_key = (source["session_id"], source["image_id"], revision, digest_file(review_dir / ANNOTATION_FILE))
+            published_key = (source["source_path"], revision, digest_file(review_dir / ANNOTATION_FILE))
             metadata = read_json(metadata_path)
             confidence = assess_review_confidence(metadata, annotation, self.thresholds)
             state = self._progress_state(progress.get(revision))
             approval_path = self.store.root / APPROVALS_DIR / f"{revision}.json"
             # 編集後に残った旧承認だけでYOLO確認済みに戻さないよう、注釈hashの一致も要求する。
-            approved = approval_path.is_file() and read_json(approval_path).get("labelme_sha256") == published_key[3]
+            approved = approval_path.is_file() and read_json(approval_path).get("labelme_sha256") == published_key[2]
             objects: list[dict[str, Any]] = []
             dino_approved = approved
             if self.store.review_store is not None:
@@ -265,11 +260,10 @@ class BatchReviewServer:
         """起動時集合、現在の撮影SQL、最新レビューの三者を照合する。"""
         revision = self._require_revision(revision)
         source = read_json(self.store.root / DRAFTS_DIR / revision / "metadata.json")["source"]
-        sample = self.samples.get((source["session_id"], source["image_id"]))
+        sample = self.samples.get(source["source_path"])
         if sample is None or not self.store.is_current_snapshot(source, sample):
             raise CaptureError("Review source is no longer current")
-        identity = content_hash([sample.session_id, sample.image_id])
-        if read_json(self.store.root / LATEST_DIR / f"{identity}.json")["revision"] != revision:
+        if not self.store.is_latest_revision(source, revision):
             raise CaptureError("Review revision is no longer current")
         return revision, self.store.current_sample(source)
 
@@ -479,7 +473,7 @@ class BatchReviewServer:
             raise TypeError("annotation must be a JSON object")
         metadata = read_json(self.store.root / DRAFTS_DIR / revision / "metadata.json")
         source = metadata["source"]
-        sample = self.samples.get((source["session_id"], source["image_id"]))
+        sample = self.samples.get(source["source_path"])
         if sample is None or not self.store.is_current_snapshot(source, sample):
             raise CaptureError("Review source is no longer present in the SQL snapshot")
         path = self.store.root / REVIEWS_DIR / revision / ANNOTATION_FILE
@@ -506,16 +500,16 @@ class BatchReviewServer:
             atomic_json(self.store.root / PROGRESS_FILE, progress)
         self.store.record_review_state(revision, False)
 
-    def _published_index(self) -> tuple[set[tuple[str, str, str, str]], set[tuple[str, str]]]:
+    def _published_index(self) -> tuple[set[tuple[str, str, str]], set[str]]:
         """既存manifestから公開済みの画像・版・注釈hashと画像識別を集める。"""
-        published: set[tuple[str, str, str, str]] = set()
-        images: set[tuple[str, str]] = set()
+        published: set[tuple[str, str, str]] = set()
+        images: set[str] = set()
         for manifest_path in sorted((self.store.root / "exports").glob("*/manifest.json")):
             for record in read_json(manifest_path).get("samples", []):
                 source = record.get("source", {})
-                image = (str(source.get("session_id")), str(source.get("image_id")))
-                published.add((*image, str(record.get("revision")), str(record.get("labelme_sha256"))))
-                images.add(image)
+                source_path = str(source.get("source_path"))
+                published.add((source_path, str(record.get("revision")), str(record.get("labelme_sha256"))))
+                images.add(source_path)
         return published, images
 
     def _publish_destination(self, session_id: str) -> Path:

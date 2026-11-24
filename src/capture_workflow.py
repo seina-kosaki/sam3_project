@@ -90,8 +90,13 @@ def main(argv: list[str] | None = None) -> int:
     output = _path(config, "output_root", base)
     if output.is_relative_to(root) or root.is_relative_to(output):
         raise CaptureError("Annotation artifacts and capture originals must use separate roots")
-    source = SqliteCaptureSource(root, timeout=config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT))
-    store = FileAnnotationStore(output, source, SqliteAnnotationLedger(root, config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT)))
+    targets = config.get("targets")
+    if "targets" in config and targets is None:
+        raise CaptureError("capture.json targets must be a non-empty list")
+    source = SqliteCaptureSource(root, timeout=config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT), targets=targets)
+    scoped_databases = source.databases() if "targets" in config else None
+    ledger = SqliteAnnotationLedger(root, config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT), scoped_databases)
+    store = FileAnnotationStore(output, source, ledger)
     prediction_store: SqlitePredictionStore | None = None
     reviews: SqliteObjectReviewStore | None = None
     if arguments.command in {"run", "annotate", "migrate-predictions", "review", "approve", "revoke", "export"}:
@@ -124,9 +129,15 @@ def main(argv: list[str] | None = None) -> int:
             return predictor
 
         prediction_store.predictor_factory = preview_predictor
-        prediction_store.initialize()
+        if scoped_databases is None:
+            prediction_store.initialize()
+        else:
+            prediction_store.initialize(scoped_databases)
         reviews = SqliteObjectReviewStore(root, config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT), prediction_store)
-        reviews.initialize()
+        if scoped_databases is None:
+            reviews.initialize()
+        else:
+            reviews.initialize(scoped_databases)
         if arguments.command == "migrate-predictions":
             store.migrate_predictions(prediction_store)
         store.review_store = reviews
@@ -158,11 +169,11 @@ def main(argv: list[str] | None = None) -> int:
                     if len(selected) > arguments.limit:
                         LOGGER.warning("選択した %s 件のうち --limit により先頭 %s 件だけを処理します", len(selected), arguments.limit)
                     selected = selected[: arguments.limit]
-                store.sync_object_reviews(set(selected))
+                store.sync_object_reviews(source_paths=set(selected))
                 selected_samples = []
-                for session_id, image_id in selected:
-                    item = selection.entry_by_identity[(session_id, image_id)]
-                    sample = source.current_sample(session_id, image_id, item["source_path"])
+                for source_path in selected:
+                    item = selection.entry_by_source_path[source_path]
+                    sample = source.current_sample(item["session_id"], item["image_id"], source_path)
                     if sample is not None:
                         selected_samples.append(sample)
                 samples = tuple(selected_samples)

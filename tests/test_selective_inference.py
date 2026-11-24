@@ -25,6 +25,7 @@ from sam3_pipeline.infrastructure.selection_server import SelectiveInferenceServ
 
 CATALOG_IMAGE_COUNT = 1000
 HTTP_CONFLICT_STATUS = 409
+HTTP_BAD_REQUEST_STATUS = 400
 HTTP_OK_STATUS = 200
 SELECTION_HTML = Path(__file__).resolve().parents[1] / "src" / "sam3_pipeline" / "interface" / "selection.html"
 BUNDLE_SCHEMA = """
@@ -118,6 +119,23 @@ class CatalogRequest:
         pass
 
 
+class SelectionPostRequest(CatalogRequest):
+    """選択POST payloadをテストする最小HTTP要求。"""
+
+    path = "/api/select"
+
+    def __init__(self, body: bytes) -> None:
+        """本文をHTTP要求streamとして渡す。"""
+        super().__init__()
+        self.headers = {"Content-Length": str(len(body))}
+        self.response_headers: list[tuple[str, str]] = []
+        self.rfile = io.BytesIO(body)
+
+    def send_header(self, name: str, value: str) -> None:
+        """応答ヘッダーを記録する。"""
+        self.response_headers.append((name, value))
+
+
 def _capture_bundle(
     root: Path,
     image_count: int = 1,
@@ -125,17 +143,32 @@ def _capture_bundle(
     capture_date: str = "2026-10-23",
 ) -> None:
     bundle = root / capture_date / session_id
-    image = bundle / "raw" / "image.png"
-    image.parent.mkdir(parents=True)
-    Image.new("RGB", (8, 8), "red").save(image)
-    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+    image_paths = []
+    for index in range(image_count):
+        image_name = "image.png" if image_count == 1 else f"image_{index:04}.png"
+        image = bundle / "raw" / image_name
+        image.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8), "red").save(image)
+        image_paths.append(image)
     with closing(sqlite3.connect(bundle / "metadata.sqlite3")) as connection, connection:
         connection.executescript(BUNDLE_SCHEMA)
         connection.execute("INSERT INTO declarations VALUES (?, ?)", ("decl", json.dumps([])))
         connection.executemany(
             "INSERT INTO images VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (session_id, f"image_{index:04}", "decl", index, image.relative_to(root).as_posix(), digest, 8, 8, 1, "tagged", None)
+                (
+                    session_id,
+                    f"image_{index:04}",
+                    "decl",
+                    index,
+                    image_paths[index].relative_to(root).as_posix(),
+                    hashlib.sha256(image_paths[index].read_bytes()).hexdigest(),
+                    8,
+                    8,
+                    1,
+                    "tagged",
+                    None,
+                )
                 for index in range(image_count)
             ],
         )
@@ -172,9 +205,66 @@ def test_selection_accepts_multiple_listed_ids_only(tmp_path: Path) -> None:
         {"session_id": "session_a", "image_id": "image_0001"},
     ]
 
-    assert selection._validated_selection(selected) == [("session_a", "image_0000"), ("session_a", "image_0001")]
+    assert selection._validated_selection(selected) == [
+        selection.entries[0]["source_path"],
+        selection.entries[1]["source_path"],
+    ]
     assert selection._validated_selection([*selected, selected[0]]) is None
     assert selection._validated_selection([{"session_id": "session_a", "image_id": "missing"}]) is None
+
+
+def test_selection_uses_source_path_when_session_and_image_are_reused(tmp_path: Path) -> None:
+    """Require source_path when identical session/image IDs occur on multiple dates."""
+    _capture_bundle(tmp_path, capture_date="2026-10-23")
+    _capture_bundle(tmp_path, capture_date="2026-10-24")
+    source = SqliteCaptureSource(tmp_path, timeout=1.0)
+    prediction_store = SqlitePredictionStore(tmp_path, tmp_path, tmp_path / "masks", 1.0)
+    prediction_store.initialize()
+    reviews = SqliteObjectReviewStore(tmp_path, 1.0, prediction_store)
+    reviews.initialize()
+    store = FileAnnotationStore(tmp_path / "output", source, review_store=reviews)
+    selection = SelectiveInferenceServer(source, store, reviews)
+    first_path = "2026-10-23/session_a/raw/image.png"
+    second_path = "2026-10-24/session_a/raw/image.png"
+
+    assert selection._validated_selection([{"session_id": "session_a", "image_id": "image_0000"}]) is None
+    assert selection._validated_selection([{"source_path": second_path}]) == [second_path]
+    assert selection.entry_by_source_path[second_path]["capture_date"] == "2026-10-24"
+    assert first_path != second_path
+    request = SelectionPostRequest(
+        json.dumps({"selected": [{"session_id": "session_a", "image_id": "image_0000"}]}).encode("utf-8")
+    )
+
+    selection._post(request)  # type: ignore[arg-type]
+
+    assert request.status == HTTP_BAD_REQUEST_STATUS
+
+
+def test_catalog_latest_drafts_are_keyed_by_source_path(tmp_path: Path) -> None:
+    """Keep latest revision status separate for reused IDs on different capture dates."""
+    _capture_bundle(tmp_path, capture_date="2026-10-23")
+    _capture_bundle(tmp_path, capture_date="2026-10-24")
+    source = SqliteCaptureSource(tmp_path, timeout=1.0)
+    prediction_store = SqlitePredictionStore(tmp_path, tmp_path, tmp_path / "masks", 1.0)
+    prediction_store.initialize()
+    reviews = SqliteObjectReviewStore(tmp_path, 1.0, prediction_store)
+    reviews.initialize()
+    store = FileAnnotationStore(tmp_path / "output", source, review_store=reviews)
+    samples_by_path = {sample.source_path: sample for sample in source.iter_samples()}
+    entries = source.catalog()
+
+    for index, item in enumerate(entries):
+        revision = f"revision-{index}"
+        metadata = {"source": {"session_id": item["session_id"], "image_id": item["image_id"], "source_path": item["source_path"]}}
+        atomic_json(store.root / DRAFTS_DIR / revision / METADATA_FILE, metadata)
+        store._mark_latest(samples_by_path[item["source_path"]], revision)
+
+    selection = SelectiveInferenceServer(source, store, reviews)
+    statuses = {item["source_path"]: selection._with_status(item) for item in entries}
+
+    assert statuses["2026-10-23/session_a/raw/image.png"]["draft"] is True
+    assert statuses["2026-10-24/session_a/raw/image.png"]["draft"] is True
+    assert content_hash("2026-10-23/session_a/raw/image.png") != content_hash("2026-10-24/session_a/raw/image.png")
 
 
 def test_live_selection_server_accepts_selection_after_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -210,7 +300,7 @@ def test_live_selection_server_accepts_selection_after_review(tmp_path: Path, mo
         selection.start()
         assert selection.url is not None
         post_selection()
-        assert selection.select() == [("session_a", "image_0000")]
+        assert selection.select() == ["2026-10-23/session_a/raw/image.png"]
 
         body = json.dumps({"selected": selected}).encode("utf-8")
         status, _body = request_selection("POST", "/api/select", body)
@@ -228,7 +318,7 @@ def test_live_selection_server_accepts_selection_after_review(tmp_path: Path, mo
 
         assert selection.review_complete.is_set()
         post_selection()
-        assert selection.select() == [("session_a", "image_0000")]
+        assert selection.select() == ["2026-10-23/session_a/raw/image.png"]
         assert selection.server is not None
         assert selection.server_thread is not None and selection.server_thread.is_alive()
     finally:
@@ -250,6 +340,7 @@ def test_catalog_keeps_unregistered_draft_as_unprocessed(tmp_path: Path) -> None
         "source": {
             "session_id": "session_a",
             "image_id": "image_0000",
+            "source_path": "2026-10-23/session_a/raw/image.png",
         }
     }
     atomic_json(store.root / DRAFTS_DIR / revision / METADATA_FILE, metadata)
@@ -345,6 +436,7 @@ def test_date_filters_sessions_and_resets_visible_page() -> None:
             "capture_date": "2026-10-23",
             "session_id": "session_a",
             "image_id": f"image_{index:04}",
+            "source_path": f"2026-10-23/session_a/raw/image_{index:04}.png",
             "width": 8,
             "height": 8,
             "draft": False,
@@ -358,6 +450,7 @@ def test_date_filters_sessions_and_resets_visible_page() -> None:
             "capture_date": "2026-10-23",
             "session_id": "session_b",
             "image_id": "image_other_first_date_session",
+            "source_path": "2026-10-23/session_b/raw/image.png",
             "width": 8,
             "height": 8,
             "draft": False,
@@ -370,6 +463,7 @@ def test_date_filters_sessions_and_resets_visible_page() -> None:
             "capture_date": "2026-10-24",
             "session_id": "session_a",
             "image_id": f"image_second_{index:04}",
+            "source_path": f"2026-10-24/session_a/raw/image_second_{index:04}.png",
             "width": 8,
             "height": 8,
             "draft": False,
@@ -384,6 +478,7 @@ def test_date_filters_sessions_and_resets_visible_page() -> None:
                 "capture_date": "2026-10-25",
                 "session_id": "session_c",
                 "image_id": "image_fallback",
+                "source_path": "2026-10-25/session_c/raw/image.png",
                 "width": 8,
                 "height": 8,
                 "draft": False,
@@ -394,6 +489,7 @@ def test_date_filters_sessions_and_resets_visible_page() -> None:
                 "capture_date": "2026-10-25",
                 "session_id": "session_z",
                 "image_id": "image_other_session",
+                "source_path": "2026-10-25/session_z/raw/image.png",
                 "width": 8,
                 "height": 8,
                 "draft": False,

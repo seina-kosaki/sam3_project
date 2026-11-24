@@ -52,7 +52,7 @@
     const session = document.querySelector("#session");
     const grid = document.querySelector("#grid");
     const notice = document.querySelector("#notice");
-    const identity = item => `${item.session_id}\u0000${item.image_id}`;
+    const identity = item => item.source_path;
     function setOptions(select, values) {
       select.innerHTML = "";
       for (const value of values) {
@@ -86,7 +86,7 @@
       currentPage = Math.min(currentPage, pageCount - 1);
       const pageItems = sessionItems.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
       grid.innerHTML = pageItems.length ? pageItems.map(item => `<article>
-        <img alt="${escapeHtml(item.image_id)}" src="/api/image?session_id=${encodeURIComponent(item.session_id)}&image_id=${encodeURIComponent(item.image_id)}">
+        <img alt="${escapeHtml(item.image_id)}" src="/api/image?source_path=${encodeURIComponent(item.source_path)}">
         <label><input type="checkbox" data-id="${encodeURIComponent(identity(item))}" ${selected.has(identity(item)) ? "checked" : ""}>
           <span>${escapeHtml(item.image_id)}<small>${escapeHtml(item.capture_date)} / ${item.width} × ${item.height}</small>
           <small>${item.draft ? "既存草案あり" : "未推論"} · YOLO: ${escapeHtml(item.yolo)} · DINO: ${escapeHtml(item.dino)}</small></span></label>
@@ -132,7 +132,7 @@
     };
     session.onchange = () => { currentPage = 0; render(); };
     document.querySelector("#submit").onclick = async () => {
-      const chosen = items.filter(item => selected.has(identity(item))).map(item => ({session_id: item.session_id, image_id: item.image_id}));
+      const chosen = items.filter(item => selected.has(identity(item))).map(item => ({source_path: item.source_path}));
       try {
         const response = await fetch("/api/select", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({selected: chosen})});
         const result = await response.json();

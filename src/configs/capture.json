@@ -2,6 +2,11 @@
   "capture_root": "../../../shared_data/",
   "output_root": "../../../annotation_work",
   "mask_root": "../../../shared_data/annotations/sam3",
+  "targets": [
+    {
+      "date": "2026-11-13"
+    }
+  ],
   "checkpoint": null,
   "bpe_path": null,
   "prompt": "metal tool",

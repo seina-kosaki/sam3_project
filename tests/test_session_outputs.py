@@ -1325,9 +1325,9 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
     )
     monkeypatch.setattr(capture_workflow, "Sam3CapturePredictor", create_predictor)
     chosen = workflow.samples[0]
-    def select_chosen_image(selection: SelectiveInferenceServer) -> list[tuple[str, str]]:
+    def select_chosen_image(selection: SelectiveInferenceServer) -> list[str]:
         selection.url = "http://127.0.0.1:12345/"
-        return [(chosen.session_id, chosen.image_id)]
+        return [chosen.source_path]
 
     monkeypatch.setattr(capture_workflow.SelectiveInferenceServer, "select", select_chosen_image)
     monkeypatch.setattr(BatchReviewServer, "serve", lambda _self, **_kwargs: None)

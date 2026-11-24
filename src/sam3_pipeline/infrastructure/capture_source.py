@@ -20,9 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
+from datetime import date as calendar_date
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -31,6 +33,8 @@ from sam3_pipeline.domain.capture import TAGGED, VISIBLE, CaptureError, CaptureS
 METADATA_NAME = "metadata.sqlite3"
 READ_ONLY_QUERY = "?mode=ro"
 MIN_CAPTURE_PATH_PARTS = 4
+DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}\Z")
+SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 
 
 def _point(raw: str | None) -> TagPoint | None:
@@ -54,10 +58,150 @@ class SqliteCaptureSource:
         taggedのRGB画像だけを選択する。DBの変更は行わない。
     """
 
-    def __init__(self, data_root: Path, timeout: float) -> None:
+    def __init__(self, data_root: Path, timeout: float, targets: Any = None) -> None:
         """Bind the source root and injected SQLite timeout."""
         self.root = data_root.resolve()
         self.timeout = timeout
+        self.targets = self._validate_targets(targets) if targets is not None else None
+
+    @staticmethod
+    def _validate_targets(value: Any) -> tuple[tuple[str, str | None], ...]:
+        """Validate date and optional session conditions before database discovery."""
+        if not isinstance(value, list) or not value:
+            raise CaptureError("capture.json targets must contain at least one date condition")
+        validated: list[tuple[str, str | None]] = []
+        for index, target in enumerate(value):
+            if not isinstance(target, dict) or set(target) - {"date", "session_id"}:
+                raise CaptureError(f"capture.json targets[{index}] is invalid")
+            capture_date = target.get("date")
+            if not isinstance(capture_date, str) or DATE_PATTERN.fullmatch(capture_date) is None:
+                raise CaptureError(f"capture.json targets[{index}].date must use YYYY-MM-DD")
+            try:
+                calendar_date.fromisoformat(capture_date)
+            except ValueError as error:
+                raise CaptureError(f"capture.json targets[{index}].date must be a real date") from error
+            has_session_id = "session_id" in target
+            session_id = target.get("session_id")
+            if has_session_id and (
+                not isinstance(session_id, str) or SESSION_ID_PATTERN.fullmatch(session_id) is None
+            ):
+                raise CaptureError(f"capture.json targets[{index}].session_id must be a safe session ID")
+            validated.append((capture_date, session_id))
+        return tuple(validated)
+
+    def databases(self) -> list[Path]:
+        """Return unique, safe session databases matching the optional target conditions."""
+        if not self.root.is_dir():
+            raise CaptureError(f"Capture root does not exist: {self.root}")
+        discovered = self._discover_databases()
+        if self.targets is None:
+            return discovered
+
+        selected: dict[Path, Path] = {}
+        for capture_date, session_id in self.targets:
+            matches = [
+                database
+                for database in discovered
+                if database.parent.parent.name == capture_date
+                and (session_id is None or database.parent.name == session_id)
+            ]
+            if not matches:
+                scope = capture_date if session_id is None else f"{capture_date}/{session_id}"
+                raise CaptureError(f"指定された対象にセッションDBがありません: {scope}")
+            for database in matches:
+                selected[database] = database
+        if not selected:
+            raise CaptureError("capture.json targets に一致するセッションDBがありません")
+        return sorted(selected.values())
+
+    def _discover_databases(self) -> list[Path]:
+        """Find only real database files in safe date/session directories below the root."""
+        databases: list[Path] = []
+        for database in sorted(self.root.glob(f"*/*/{METADATA_NAME}")):
+            date_directory = database.parent.parent
+            session_directory = database.parent
+            capture_date = date_directory.name
+            session_id = session_directory.name
+            safe_date = self._is_real_date(capture_date)
+            safe_session = SESSION_ID_PATTERN.fullmatch(session_id) is not None
+            has_real_directories = date_directory.is_dir() and session_directory.is_dir()
+            has_no_symlinks = not date_directory.is_symlink() and not session_directory.is_symlink() and not database.is_symlink()
+            resolved_database = database.resolve()
+            stays_below_root = resolved_database.is_relative_to(self.root)
+            is_safe_database = (
+                safe_date
+                and safe_session
+                and has_real_directories
+                and has_no_symlinks
+                and stays_below_root
+                and resolved_database.is_file()
+            )
+            if is_safe_database:
+                databases.append(resolved_database)
+        return databases
+
+    @staticmethod
+    def _is_real_date(value: str) -> bool:
+        """Return whether a directory name is an actual ISO calendar date."""
+        if DATE_PATTERN.fullmatch(value) is None:
+            return False
+        try:
+            calendar_date.fromisoformat(value)
+        except ValueError:
+            return False
+        return True
+
+    def _require_databases(self) -> list[Path]:
+        """Require discovered databases for operations that enumerate capture input."""
+        databases = self.databases()
+        if not databases:
+            raise CaptureError(f"No session bundles found: {self.root}")
+        return databases
+
+    def _database_for_image(self, source_path: str, session_id: str) -> tuple[Path | None, PurePosixPath]:
+        """Resolve an image only through the already discovered database allow-list."""
+        relative = PurePosixPath(source_path)
+        is_unsafe_path = (
+            relative.is_absolute()
+            or len(relative.parts) < MIN_CAPTURE_PATH_PARTS
+            or ".." in relative.parts
+            or "\\" in source_path
+            or relative.as_posix() != source_path
+        )
+        if is_unsafe_path:
+            raise CaptureError(f"Invalid capture-relative path: {source_path}")
+        capture_date, path_session = relative.parts[:2]
+        if path_session != session_id:
+            return None, relative
+        database = next(
+            (
+                candidate
+                for candidate in self.databases()
+                if candidate.parent.name == path_session and candidate.parent.parent.name == capture_date
+            ),
+            None,
+        )
+        if database is None:
+            return None, relative
+        return database, relative
+
+    def _image_file(self, relative: PurePosixPath, database: Path) -> Path:
+        """Resolve a database image path and require it to remain in its session."""
+        expected_prefix = (database.parent.parent.name, database.parent.name)
+        has_session_prefix = relative.parts[:2] == expected_prefix
+        safe_relative = (
+            not relative.is_absolute()
+            and len(relative.parts) >= MIN_CAPTURE_PATH_PARTS
+            and ".." not in relative.parts
+            and "\\" not in relative.as_posix()
+        )
+        if not safe_relative or not has_session_prefix:
+            raise CaptureError(f"Image path does not belong to session database: {relative}")
+        image_path = (self.root / Path(*relative.parts)).resolve()
+        session_root = database.parent.resolve()
+        if not image_path.is_relative_to(session_root):
+            raise CaptureError(f"Unsafe image path: {relative}")
+        return image_path
 
     def iter_samples(self) -> Iterator[CaptureSample]:
         """各セッションDBの読み取りスナップショットから画像とタグを取得する。
@@ -68,12 +212,7 @@ class SqliteCaptureSource:
         Raises:
             CaptureError: 入力ルートやセッションDBがない、または撮影データが不正な場合。
         """
-        if not self.root.is_dir():
-            raise CaptureError(f"Capture root does not exist: {self.root}")
-        # 旧DBが残っていても、追加・更新されたセッションDBを唯一の入力とする。
-        databases = sorted(self.root.glob(f"*/*/{METADATA_NAME}"))
-        if not databases:
-            raise CaptureError(f"No session bundles found: {self.root}")
+        databases = self._require_databases()
         for database in databases:
             try:
                 # 撮影中の変更を混在させず、セッション内の画像・宣言・タグを一貫して読む。
@@ -81,18 +220,14 @@ class SqliteCaptureSource:
                     connection.row_factory = sqlite3.Row
                     connection.execute("BEGIN")
                     rows = connection.execute("SELECT * FROM images WHERE tag_status = ? ORDER BY image_id", (TAGGED,)).fetchall()
-                    samples = [self._sample(connection, row) for row in rows]
+                    samples = [self._sample(connection, row, database) for row in rows]
                 yield from samples
             except (sqlite3.Error, OSError, ValueError, KeyError, IndexError, TypeError, CaptureError) as error:
                 raise CaptureError(f"撮影セッションDBが不正である: {database}: {error}") from error
 
     def catalog(self) -> list[dict[str, Any]]:
         """画像内容を読まず、選択画面に必要な撮影SQL項目だけを返す。"""
-        if not self.root.is_dir():
-            raise CaptureError(f"Capture root does not exist: {self.root}")
-        databases = sorted(self.root.glob(f"*/*/{METADATA_NAME}"))
-        if not databases:
-            raise CaptureError(f"No session bundles found: {self.root}")
+        databases = self._require_databases()
         entries = []
         try:
             for database in databases:
@@ -103,8 +238,11 @@ class SqliteCaptureSource:
                         (TAGGED,),
                     ).fetchall()
                 for row in rows:
-                    image_path = (self.root / row["path"]).resolve()
-                    if not image_path.is_relative_to(self.root) or not image_path.is_file():
+                    if row["session_id"] != database.parent.name:
+                        raise CaptureError(f"Image session_id does not match its database: {database}")
+                    relative = PurePosixPath(row["path"])
+                    image_path = self._image_file(relative, database)
+                    if not image_path.is_file():
                         raise CaptureError(f"Missing or unsafe image path: {row['path']}")
                     entries.append(
                         {
@@ -138,13 +276,8 @@ class SqliteCaptureSource:
         Raises:
             CaptureError: パス、DBレコード、画像内容が不正である場合。
         """
-        relative = PurePosixPath(source_path)
-        if relative.is_absolute() or len(relative.parts) < MIN_CAPTURE_PATH_PARTS or ".." in relative.parts or "\\" in source_path or relative.as_posix() != source_path:
-            raise CaptureError(f"Invalid capture-relative path: {source_path}")
-        database = self._database_path(relative)
-        if not database.is_relative_to(self.root):
-            raise CaptureError(f"Unsafe metadata path: {database}")
-        if not database.is_file():
+        database, _relative = self._database_for_image(source_path, session_id)
+        if database is None:
             return None
         try:
             with closing(sqlite3.connect(database.as_uri() + READ_ONLY_QUERY, uri=True, timeout=self.timeout)) as connection:
@@ -155,12 +288,10 @@ class SqliteCaptureSource:
                 ).fetchone()
                 if row is None or row["tag_status"] != TAGGED or row["path"] != source_path:
                     return None
-                image_path = (self.root / row["path"]).resolve()
-                if not image_path.is_relative_to(self.root):
-                    raise CaptureError(f"Unsafe image path: {row['path']}")
+                image_path = self._image_file(PurePosixPath(row["path"]), database)
                 if not image_path.is_file():
                     return None
-                return self._sample(connection, row)
+                return self._sample(connection, row, database)
         except (sqlite3.Error, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             raise CaptureError(f"撮影セッションDBが不正である: {database}: {error}") from error
 
@@ -176,14 +307,11 @@ class SqliteCaptureSource:
         Raises:
             CaptureError: 所属セッションDBが破損、またはスキーマが不正な場合。
         """
-        relative = PurePosixPath(sample.source_path)
-        if relative.is_absolute() or len(relative.parts) < MIN_CAPTURE_PATH_PARTS or ".." in relative.parts or "\\" in sample.source_path or relative.as_posix() != sample.source_path:
+        database, relative = self._database_for_image(sample.source_path, sample.session_id)
+        if database is None:
             return False
-        database = self._database_path(relative)
-        if not database.is_relative_to(self.root):
-            return False
-        image_path = (self.root / Path(*relative.parts)).resolve()
-        if not database.is_file() or not image_path.is_relative_to(self.root) or not image_path.is_file():
+        image_path = self._image_file(relative, database)
+        if not image_path.is_file():
             return False
         try:
             with closing(sqlite3.connect(database.as_uri() + READ_ONLY_QUERY, uri=True, timeout=self.timeout)) as connection:
@@ -206,10 +334,12 @@ class SqliteCaptureSource:
         except (sqlite3.Error, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             raise CaptureError(f"撮影セッションDBが不正である: {database}: {error}") from error
 
-    def _sample(self, connection: sqlite3.Connection, row: sqlite3.Row) -> CaptureSample:
+    def _sample(self, connection: sqlite3.Connection, row: sqlite3.Row, database: Path) -> CaptureSample:
         """Resolve capture-root-relative images and preserve declaration name snapshots."""
-        image_path = (self.root / row["path"]).resolve()
-        if not image_path.is_relative_to(self.root) or not image_path.is_file():
+        if row["session_id"] != database.parent.name:
+            raise CaptureError(f"Image session_id does not match its database: {database}")
+        image_path = self._image_file(PurePosixPath(row["path"]), database)
+        if not image_path.is_file():
             raise CaptureError(f"Missing or unsafe image path: {row['path']}")
         digest = self._digest(image_path)
         if row["sha256"] and row["sha256"] != digest:
@@ -233,17 +363,6 @@ class SqliteCaptureSource:
             instruments=tuple(sorted(names.items())),
             source_path=row["path"],
         )
-
-    def _database_path(self, source_path: PurePosixPath) -> Path:
-        """画像のルート相対パスから所属セッションのDBを特定する。
-
-        Args:
-            source_path: 日付とセッションを先頭に持つ検証済みの画像相対パス。
-
-        Returns:
-            所属セッションのmetadata.sqlite3の絶対パス。
-        """
-        return self.root.joinpath(*source_path.parts[:2], METADATA_NAME).resolve()
 
     @staticmethod
     def _digest(path: Path) -> str:
