@@ -6,6 +6,8 @@
   "bpe_path": null,
   "prompt": "metal tool",
   "min_score": 0.5,
+  "use_yolo": true,
+  "yolo_confidence": 0.8,
   "sqlite_timeout": 10.0,
   "matching": {
     "max_distance": 0.03,

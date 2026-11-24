@@ -332,7 +332,13 @@ def test_constructor_external_mask_root_rejects_destination(tmp_path: Path) -> N
 def test_save_model_metadata_records_recipe(storage: tuple[SqlitePredictionStore, CaptureSample]) -> None:
     """非機密のモデル設定を署名とともに保存する。"""
     store, sample = storage
-    metadata = {"prompt": "metal tool", "min_score": 0.5}
+    metadata = {
+        "prompt": "metal tool",
+        "min_score": 0.5,
+        "use_yolo": True,
+        "yolo_confidence": 0.8,
+        "yolo_weights_sha256": "a" * 64,
+    }
     configured = SqlitePredictionStore(store.database_path, store.data_root, store.mask_root, store.timeout, model_metadata=metadata)
 
     configured.save(sample, _prediction_id(sample), (_candidate(),), SIGNATURE)

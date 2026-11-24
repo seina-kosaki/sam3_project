@@ -42,6 +42,7 @@ from sam3_pipeline.infrastructure.selection_server import SelectiveInferenceServ
 from sam3_pipeline.infrastructure.session_database import session_database
 
 IMAGE_SIZE = 8
+DEFAULT_YOLO_CONFIDENCE = 0.8
 ORIGINAL_LEFT = 2.0
 SIGNATURE = "session-model"
 MODEL_METADATA = {"prompt": "metal tool", "min_score": 0.5}
@@ -1259,6 +1260,15 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
         def __init__(self) -> None:
             """推論キーに使用するモデル署名を設定する。"""
             self.signature: str = signature
+            self.model_metadata: dict[str, object] = {
+                "checkpoint": None,
+                "bpe_path": None,
+                "prompt": "instrument",
+                "min_score": 0.45,
+                "use_yolo": False,
+                "yolo_confidence": DEFAULT_YOLO_CONFIDENCE,
+                "yolo_weights_sha256": None,
+            }
 
         def initialize(self) -> None:
             """実モデルの事前初期化APIをテスト用予測器に合わせる。"""
@@ -1274,7 +1284,15 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
             """
             return candidates
 
-    def create_predictor(checkpoint: Path | None, prompt: str, min_score: float, bpe_path: Path | None) -> Predictor:
+    def create_predictor(
+        checkpoint: Path | None,
+        prompt: str,
+        min_score: float,
+        bpe_path: Path | None,
+        *,
+        use_yolo: bool = False,
+        yolo_confidence: float = DEFAULT_YOLO_CONFIDENCE,
+    ) -> Predictor:
         """モデル生成時に設定が引き渡されることを確認する。
 
         Args:
@@ -1282,11 +1300,14 @@ def test_session_outputs_cli_inference_uses_session_databases(workflow: Workflow
             prompt: 全画像共通プロンプト。
             min_score: 推論スコア閾値。
             bpe_path: 任意の語彙パス。
+            use_yolo: YOLO bboxをSAM3へ渡すか。
+            yolo_confidence: YOLO検出の信頼度閾値。
 
         Returns:
             実モデルをロードしない推論代替。
         """
         assert checkpoint is None and bpe_path is None
+        assert use_yolo is False and yolo_confidence == DEFAULT_YOLO_CONFIDENCE
         assert (prompt, min_score) == ("instrument", 0.45)
         return Predictor()
 

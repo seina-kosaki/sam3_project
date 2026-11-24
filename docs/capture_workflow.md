@@ -1,6 +1,8 @@
 # 撮影 → 半自動アノテーション → YOLO学習
 
 > 現行のレビュー手順と追加仕様: [レビューUI改善仕様](review_ui_improvements.md)と[YOLO部分公開契約](contracts/yolo_publication.md)を参照。YOLO一括確認・候補に応じた保存、DINOタグ単位の部分保存、2026-11-13合意の一括確認APIは実装・自動テスト済みで、手動確認待ち。公開済み変更版の扱いは保留中。
+>
+> SAM3へのYOLO bbox入力を追加する場合は[合意済み仕様](sam3_yolo_bbox_inference.md)を参照する。公開契約はSAM3推論結果だけを公開対象とする既存範囲を維持し、追加の契約変更は不要。
 
 ## 対象と前提
 
@@ -8,10 +10,10 @@
 - 撮影APIはセッションごとにDBを作成する。SAM3の入力は各セッションの撮影・タグ表を正本とし、ルート直下の旧`metadata.sqlite3`は読み込まない。旧DBへのフォールバック・移行・削除は行わない。
 - 撮影・推論原本・レビュー・承認台帳・公開状態は、すべて所属セッションDBを正本とする。SAM3の通常CLIはルート直下の旧単一DBを必要としない。今回の対応はSAM3側の保存までであり、DINOv3・YOLO側のセッション横断読み取りと日次レポートJSONの形式は変更しない。
 - `tag_status=tagged` の画像だけを取り込む。撮影直後の未タグ画像は推論対象にしない。
-- SAM3には全画像で同じテキストを1回だけ与える。器具名別推論、フォールバック、タグ点を入力した追加推論は行わない。
+- SAM3には全画像で同じテキストプロンプトを使う。器具名別推論やタグ点を入力した追加推論は行わない。YOLO bbox入力の有効化と、正常なYOLO検出0件時のテキスト単独推論へのフォールバックは[YOLO bbox入力仕様](sam3_yolo_bbox_inference.md)に従う。
 - タグは推論後の「マスク候補 → 器具UID」の対応付けに使用する。共通プロンプトによる全器具の検出は保証されない。
 - 最初の対象タスクはYOLOの矩形物体検出。polygon・point形状を学習用矩形として誤変換しない。
-- Python 3.12を使う。SAM3とYOLOは各プロジェクトのuv環境を分離したまま実行する。
+- Python 3.12を使う。YOLO bboxをSAM3推論で使う場合は、SAM3実行環境に`ultralytics`をインストールする。YOLOの学習環境は引き続き分離する。
 
 ## 設定
 
@@ -26,6 +28,9 @@
 | `bpe_path` | 明示指定しない場合はインストール済みSAM3の語彙ファイル |
 | `prompt` | 全画像共通のテキスト。初期値は `surgical instrument` |
 | `min_score` | SAM3 processorと出力候補に適用する閾値 |
+| `use_yolo` | SAM3推論へ検出bboxを渡すか。初期値は `false`。`true`時だけYOLO推論を実行する |
+| `yolo_confidence` | YOLO検出のconfidence閾値。初期値は `0.8`。有効値は `0`以上`1`以下 |
+| YOLO重み設定 | `use_yolo=true`時は `src/configs/settings_yolo.yaml` を使用し、指定された重みファイルの内容hashをキャッシュ署名に含める |
 | `matching.max_distance` | 中心点からマスクまでの許容距離。画像対角長に対する比率 |
 | `matching.ambiguity_margin` | 対応付け候補のコスト差が小さい場合に確定を保留する閾値 |
 | `review_confidence.medium_score` | 中信頼度として扱う最低SAM3スコア |
@@ -102,6 +107,7 @@ annotation_work/
 
 キャッシュは画像・重み・プロンプト・閾値・実装識別情報から決定する。
 タグ更新や対応付け設定だけの変更ではモデル候補を再利用する。
+YOLOを使う場合は利用有無・confidence・`settings_yolo.yaml`から解決した重みファイル内容hashも署名に含めるため、YOLOあり／なしや異なるYOLO重みのキャッシュを混同しない。YOLO推論が正常終了して検出0件ならテキスト単独推論へ進むが、YOLO推論自体の失敗は明示的な失敗とし、SAM3単独推論へ切り替えない。詳細は[YOLO bbox入力仕様](sam3_yolo_bbox_inference.md)を参照。
 再実行は同じレビューJSONを上書きしない。タグが更新されると別リビジョンができ、旧承認の新規出力を拒否する。
 
 ### 推論原本のSQL・PNG保存と移行

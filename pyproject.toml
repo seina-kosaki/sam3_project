@@ -22,6 +22,7 @@ dependencies = [
     "pillow",
     "pyyaml",
     "pywin32>=312 ; sys_platform == 'win32'",
+    "ultralytics",
 ]
 
 
@@ -42,6 +43,7 @@ torchaudio = { index = "pytorch-cu128" }
 flash-attn-3 = { index = "flash-attn-cu128" }
 # 2. GitHub のリポジトリURL（およびブランチ/タグ/コミットHash）を指定
 sam3 = { git = "https://github.com/facebookresearch/sam3.git", branch = "main" }
+ultralytics = { git = "https://github.com/sunsmarterjie/yolov12", branch = "main" }
 
 [dependency-groups]
 dev = [

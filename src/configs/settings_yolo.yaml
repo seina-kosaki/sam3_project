@@ -1,0 +1,4 @@
+# 推論に使用する重みファイル（このYAMLからの相対パス）
+weights: ../yolov12/weights/best.pt
+# この値未満の検出を結果から除外する信頼度しきい値
+confidence_threshold: 0.5

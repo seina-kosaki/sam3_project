@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +77,14 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     config_path = arguments.config.resolve()
     config = read_json(config_path)
+    use_yolo = config.get("use_yolo", False)
+    yolo_confidence = config.get("yolo_confidence", 0.8)
+    if not isinstance(use_yolo, bool):
+        raise CaptureError("capture.json use_yolo must be a boolean")
+    confidence_is_number = isinstance(yolo_confidence, (int, float)) and not isinstance(yolo_confidence, bool)
+    confidence_is_valid = confidence_is_number and math.isfinite(yolo_confidence) and 0 <= yolo_confidence <= 1
+    if not confidence_is_valid:
+        raise CaptureError("capture.json yolo_confidence must be a finite number from 0 to 1")
     base = config_path.parent
     root = _path(config, "capture_root", base)
     output = _path(config, "output_root", base)
@@ -88,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command in {"run", "annotate", "migrate-predictions", "review", "approve", "revoke", "export"}:
         mask_root = _path(config, "mask_root", base) if config.get("mask_root") else root / DEFAULT_MASK_DIRECTORY
         model_metadata = {name: config.get(name) for name in ("checkpoint", "bpe_path", "prompt", "min_score")}
+        model_metadata.update({"use_yolo": use_yolo, "yolo_confidence": yolo_confidence, "yolo_weights_sha256": None})
         prediction_store = SqlitePredictionStore(root, root, mask_root, config.get("sqlite_timeout", DEFAULT_SQLITE_TIMEOUT), model_metadata=model_metadata)
         predictor: Sam3CapturePredictor | None = None
 
@@ -101,7 +111,16 @@ def main(argv: list[str] | None = None) -> int:
             if predictor is None:
                 load_dotenv(Path(__file__).parent / ".env")
                 checkpoint = _path(config, "checkpoint", base) if config.get("checkpoint") else None
-                predictor = Sam3CapturePredictor(checkpoint, config["prompt"], config["min_score"], _path(config, "bpe_path", base) if config.get("bpe_path") else None)
+                predictor = Sam3CapturePredictor(
+                    checkpoint,
+                    config["prompt"],
+                    config["min_score"],
+                    _path(config, "bpe_path", base) if config.get("bpe_path") else None,
+                    use_yolo=use_yolo,
+                    yolo_confidence=yolo_confidence,
+                )
+                if prediction_store is not None:
+                    prediction_store.model_metadata = predictor.model_metadata
             return predictor
 
         prediction_store.predictor_factory = preview_predictor
@@ -119,6 +138,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             predictor = preview_predictor()
             predictor.initialize()
+        except CaptureError as error:
+            if "YOLO" in str(error):
+                raise
+            LOGGER.exception("SAM3 model initialization failed")
+            raise CaptureError("SAM3 model initialization failed") from error
         except Exception as error:
             LOGGER.exception("SAM3モデルの初期化に失敗しました")
             raise CaptureError("SAM3モデル初期化に失敗したため、推論を開始できません") from error
