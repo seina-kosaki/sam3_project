@@ -4,7 +4,10 @@ output_root: results_analyze
 
 # 解析対象は1件以上指定してください。条件を複数書くとOR条件になり、重複するセッションは1回だけ解析します。
 # dateにはcapture_root直下の日付ディレクトリ名（YYYY-MM-DD）を指定します。
-# session_idは省略するとその日付の全セッション、指定するとそのセッションだけを選びます。
+# session_idまたはsession_idsを省略するとその日付の全セッションを選びます。
+# session_idは既存の単独指定、session_idsは同じ日付の複数セッション指定に使います。
+# 同一target項目でsession_idとsession_idsを併用できません。session_idsは1件以上必要です。
+# 新旧形式は異なるtarget項目間で併用できます。
 # 以下の例から使う形式を選び、そのtargetsブロックだけを有効にしてください。
 #
 # 例1: 2026-11-24の全セッションを解析する
@@ -16,13 +19,36 @@ output_root: results_analyze
 #   - date: "2026-11-24"
 #     session_id: "session_001"
 #
-# 例3: ある日付の全セッションと、別日の特定セッションを解析する
+# 例3: 2026-11-24の複数セッションだけを解析する
 # targets:
 #   - date: "2026-11-24"
+#     session_ids:
+#       - "session_001"
+#       - "session_002"
+#
+# 例4: 新旧形式と、全セッション指定を複数targetで併用する
+# targets:
+#   - date: "2026-11-24"
+#     session_ids: ["session_001", "session_002"]
 #   - date: "2026-11-25"
-#     session_id: "session_002"
+#     session_id: "session_003"
+#   - date: "2026-11-26"
 #
 # session_idだけの指定や空のtargetsは使用できません。
-targets: 
-  - date: "2026-11-12"
+targets:
+  - date: "2026-11-24"
+    session_ids:
+      - "session_113832_000000_0b4006"
+      - "session_114606_000000_9348e7"
+      - "session_115144_000000_36ee07"
+      - "session_115804_000000_e77a99"
+      - "session_120459_000000_9732ef"
+      - "session_125914_000000_adb533"
+      - "session_130448_000000_73d12b"
+      - "session_131121_000000_b3c333"
+      - "session_131656_000000_67f9f5"
+      - "session_132303_000000_6aac91"
+      - "session_132900_000000_bfac96"
+      - "session_133445_000000_5e10d0"
+
 

@@ -4,13 +4,59 @@
   "mask_root": "../../../shared_data/annotations/sam3",
   "targets": [
     {
-      "date": "2026-11-13"
+      "date": "2026-11-24",
+      "session_id": "session_113832_000000_0b4006"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_114606_000000_9348e7"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_115144_000000_36ee07"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_115804_000000_e77a99"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_120459_000000_9732ef"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_125914_000000_adb533"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_130448_000000_73d12b"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_131121_000000_b3c333"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_131656_000000_67f9f5"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_132303_000000_6aac91"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_132900_000000_bfac96"
+    },
+    {
+      "date": "2026-11-24",
+      "session_id": "session_133445_000000_5e10d0"
     }
   ],
   "checkpoint": null,
   "bpe_path": null,
   "prompt": "metal tool",
   "min_score": 0.5,
+
   "use_yolo": true,
   "yolo_confidence": 0.8,
   "sqlite_timeout": 10.0,

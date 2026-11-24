@@ -1,0 +1,16 @@
+output_root: results_analyze
+targets:
+- date: '2026-11-24'
+  session_ids:
+  - session_101311_000000_dadbc7
+  - session_101947_000000_61c766
+  - session_102601_000000_b14729
+  - session_103233_000000_df9e3e
+  - session_103823_000000_d421f8
+  - session_104528_000000_25f413
+  - session_110031_000000_dac5f8
+  - session_110713_000000_f4466f
+  - session_111310_000000_5fd6ef
+  - session_111919_000000_3a4496
+  - session_112528_000000_e8775b
+  - session_113105_000000_781595

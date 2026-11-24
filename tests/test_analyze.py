@@ -177,6 +177,39 @@ def test_validate_targets_accepts_date_and_session_filters() -> None:
     ]
 
 
+def test_validate_targets_accepts_multiple_sessions_and_mixed_target_formats() -> None:
+    """session_idsと既存形式をtarget間で保持する。"""
+    targets = [
+        {"date": "2026-11-24", "session_ids": ["session_a", "session_b"]},
+        {"date": "2026-11-25", "session_id": "session_c"},
+        {"date": "2026-11-26"},
+    ]
+
+    assert _validate_targets(targets) == targets
+
+
+def test_validate_targets_rejects_unknown_keys() -> None:
+    """未対応のtarget項目を無視して日付全体指定に広げない。"""
+    with pytest.raises(CaptureError, match="未対応"):
+        _validate_targets([{"date": "2026-11-24", "session_idss": ["session_a"]}])
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"date": "2026-11-24", "session_ids": []},
+        {"date": "2026-11-24", "session_ids": "session_a"},
+        {"date": "2026-11-24", "session_ids": ["../outside"]},
+        {"date": "2026-11-24", "session_ids": ["x" * 81]},
+        {"date": "2026-11-24", "session_id": "session_a", "session_ids": ["session_b"]},
+    ],
+)
+def test_validate_targets_rejects_invalid_session_ids(target: Any) -> None:
+    """空配列・不安全ID・長すぎるID・同一target併用を拒否する。"""
+    with pytest.raises(CaptureError, match="session"):
+        _validate_targets([target])
+
+
 def test_select_databases_unions_conditions_without_duplicates(tmp_path: Path) -> None:
     """重複条件を一つのセッションDBとして選択する。"""
     database = tmp_path / "2026-11-24" / "session_a" / "metadata.sqlite3"
@@ -189,6 +222,43 @@ def test_select_databases_unions_conditions_without_duplicates(tmp_path: Path) -
     )
 
     assert selected == [("2026-11-24", "session_a", database.resolve())]
+
+
+def test_select_databases_limits_multiple_sessions_and_deduplicates_targets(tmp_path: Path) -> None:
+    """複数指定したDBだけを選び、重複するtargetを一つにまとめる。"""
+    session_ids = ["session_a", "session_b", "session_c"]
+    databases = []
+    for session_id in session_ids:
+        database = tmp_path / "2026-11-24" / session_id / "metadata.sqlite3"
+        database.parent.mkdir(parents=True)
+        database.touch()
+        databases.append(database.resolve())
+
+    selected = _select_databases(
+        tmp_path,
+        [
+            {"date": "2026-11-24", "session_ids": ["session_a", "session_c"]},
+            {"date": "2026-11-24", "session_id": "session_a"},
+        ],
+    )
+
+    assert selected == [
+        ("2026-11-24", "session_a", databases[0]),
+        ("2026-11-24", "session_c", databases[2]),
+    ]
+
+
+def test_select_databases_rejects_unknown_session_in_multiple_selection(tmp_path: Path) -> None:
+    """複数指定に存在しないセッションがあれば、黙って除外せず失敗する。"""
+    database = tmp_path / "2026-11-24" / "session_a" / "metadata.sqlite3"
+    database.parent.mkdir(parents=True)
+    database.touch()
+
+    with pytest.raises(CaptureError, match=r"metadata\.sqlite3"):
+        _select_databases(
+            tmp_path,
+            [{"date": "2026-11-24", "session_ids": ["session_a", "session_missing"]}],
+        )
 
 
 def test_safe_output_root_resolves_relative_path_from_project_root(tmp_path: Path) -> None:

@@ -40,6 +40,7 @@ MAX_FAILURE_EXAMPLES = 3
 RECTANGLE_POINT_COUNT = 2
 BBOX_COORDINATE_COUNT = 4
 MIN_SESSION_DATABASE_PARTS = 3
+MAX_SESSION_ID_LENGTH = 80
 SESSION_PATH_PARTS = 2
 TABLE_COLUMN_WIDTHS = (300, 120, 120, 120, 130, 160, 120, 120, 130, 150, 140, 210)
 TABLE_CELL_PADDING = 12
@@ -195,34 +196,54 @@ def _load_settings() -> tuple[dict[str, Any], dict[str, Any], Path]:
     return settings, capture_settings, capture_root
 
 
-def _validate_targets(value: Any) -> list[dict[str, str]]:
+def _validate_targets(value: Any) -> list[dict[str, Any]]:
     """空指定・session ID単独・不正日付を解析前に拒否する。"""
     if not isinstance(value, list) or not value:
         raise CaptureError("analyze.yaml の targets に日付条件を1件以上指定してください")
-    targets: list[dict[str, str]] = []
+    targets: list[dict[str, Any]] = []
     for index, target in enumerate(value):
         if not isinstance(target, dict):
             raise CaptureError(f"analyze.yaml targets[{index}] はmappingである必要があります")
+        allowed_keys = {"date", "session_id", "session_ids"}
+        unknown_keys = set(target) - allowed_keys
+        if unknown_keys:
+            raise CaptureError(f"analyze.yaml targets[{index}] に未対応の設定項目があります")
         date = target.get("date")
         session_id = target.get("session_id")
+        session_ids = target.get("session_ids")
         if not isinstance(date, str) or DATE_PATTERN.fullmatch(date) is None:
             raise CaptureError(f"analyze.yaml targets[{index}].date はYYYY-MM-DD形式で指定してください")
         try:
             calendar_date.fromisoformat(date)
         except ValueError as error:
             raise CaptureError(f"analyze.yaml targets[{index}].date は実在する日付にしてください") from error
-        selected: dict[str, str] = {"date": date}
-        if session_id is not None:
-            safe_session = isinstance(session_id, str) and SESSION_ID_PATTERN.fullmatch(session_id) is not None
-            path_safe = safe_session and session_id not in {".", ".."}
-            if not path_safe:
-                raise CaptureError(f"analyze.yaml targets[{index}].session_id は安全なセッションIDにしてください")
+        has_session_id = "session_id" in target
+        has_session_ids = "session_ids" in target
+        if has_session_id and has_session_ids:
+            raise CaptureError(f"analyze.yaml targets[{index}] でsession_idとsession_idsは併用できません")
+        selected: dict[str, Any] = {"date": date}
+        if has_session_id:
+            _validate_session_id(session_id, f"targets[{index}].session_id")
             selected["session_id"] = session_id
+        if has_session_ids:
+            if not isinstance(session_ids, list) or not session_ids:
+                raise CaptureError(f"analyze.yaml targets[{index}].session_ids は1件以上の配列にしてください")
+            for session_index, requested_session_id in enumerate(session_ids):
+                _validate_session_id(requested_session_id, f"targets[{index}].session_ids[{session_index}]")
+            selected["session_ids"] = session_ids
         targets.append(selected)
     return targets
 
 
-def _select_databases(capture_root: Path, targets: list[dict[str, str]]) -> list[tuple[str, str, Path]]:
+def _validate_session_id(session_id: Any, setting_name: str) -> None:
+    """設定されたセッションIDが安全なディレクトリ名であることを確認する。"""
+    is_safe_id = isinstance(session_id, str) and SESSION_ID_PATTERN.fullmatch(session_id) is not None
+    has_valid_length = isinstance(session_id, str) and len(session_id) <= MAX_SESSION_ID_LENGTH
+    if not is_safe_id or not has_valid_length:
+        raise CaptureError(f"analyze.yaml {setting_name} は安全なセッションIDにしてください")
+
+
+def _select_databases(capture_root: Path, targets: list[dict[str, Any]]) -> list[tuple[str, str, Path]]:
     """複数条件の和集合から重複しない日付・セッションDBを選ぶ。"""
     root = capture_root.resolve()
     selected: dict[Path, tuple[str, str, Path]] = {}
@@ -231,8 +252,19 @@ def _select_databases(capture_root: Path, targets: list[dict[str, str]]) -> list
         date_directory = (root / date).resolve()
         if not date_directory.is_relative_to(root) or not date_directory.is_dir():
             continue
-        requested_session = target.get("session_id")
-        sessions = [date_directory / requested_session] if requested_session else sorted(date_directory.iterdir())
+        requested_session_ids = target.get("session_ids")
+        has_explicit_session_filter = requested_session_ids is not None
+        if requested_session_ids is not None:
+            sessions = []
+            for session_id in requested_session_ids:
+                sessions.append(date_directory / session_id)
+        else:
+            requested_session = target.get("session_id")
+            if requested_session:
+                has_explicit_session_filter = True
+                sessions = [date_directory / requested_session]
+            else:
+                sessions = sorted(date_directory.iterdir())
         for session_directory in sessions:
             database = (session_directory / METADATA_NAME).resolve()
             inside_root = database.is_relative_to(root)
@@ -240,7 +272,13 @@ def _select_databases(capture_root: Path, targets: list[dict[str, str]]) -> list
             has_database = database.is_file()
             relative_parts = database.relative_to(root).parts if inside_root else ()
             is_expected_session = len(relative_parts) >= MIN_SESSION_DATABASE_PARTS and relative_parts[:2] == (date, session_directory.name)
-            if inside_root and session_exists and has_database and is_expected_session:
+            is_selectable_database = inside_root and session_exists and has_database and is_expected_session
+            if has_explicit_session_filter and not is_selectable_database:
+                raise CaptureError(
+                    f"指定した日付・セッションに解析可能なmetadata.sqlite3がありません: "
+                    f"{date}/{session_directory.name}"
+                )
+            if is_selectable_database:
                 selected[database] = (date, session_directory.name, database)
     if not selected:
         raise CaptureError("指定した日付・セッションに解析可能なmetadata.sqlite3がありません")

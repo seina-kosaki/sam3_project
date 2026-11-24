@@ -23,7 +23,7 @@
 | パス | 内容 |
 |---|---|
 | [docs/capture_workflow.md](capture_workflow.md) | 撮影から推論・レビュー・公開までの手順 |
-| [src/configs/analyze.yaml](../src/configs/analyze.yaml) | 解析対象条件と出力先`output_root`の実行時設定 |
+| [src/configs/analyze.yaml](../src/configs/analyze.yaml) | 解析対象条件と出力先`output_root`の実行時設定。`session_id`（単独・後方互換）または`session_ids`（同日複数・1件以上）を日付別targetで指定し、複数targetはOR |
 | [docs/analysis_specification.md](analysis_specification.md) | 全体および器具種別ごとの解析指標・対象範囲・出力仕様 |
 | [docs/sam3_yolo_bbox_inference.md](sam3_yolo_bbox_inference.md) | capture設定によるYOLO bboxのSAM3 visual prompt入力仕様 |
 | [docs/review_ui_improvements.md](review_ui_improvements.md) | 合意済みのYOLO/DINOレビューUI改善 |
